@@ -516,116 +516,262 @@ struct ManagerView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-            Divider()
+            Divider().opacity(0.6)
             detail
         }
-        .frame(minWidth: 860, minHeight: 560)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 980, minHeight: 660)
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Codex Accounts")
-                .font(.title2.weight(.semibold))
-            Text("Local profile switcher")
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                Image(systemName: "person.2.badge.key.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 38, height: 38)
+                    .background(Color.accentColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
 
-            List(selection: $store.selectedID) {
-                ForEach(store.rows) { row in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(row.name)
-                                .font(.system(size: 14, weight: .medium))
-                            if row.isActive {
-                                Text("ACTIVE")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 2)
-                                    .background(Color.accentColor.opacity(0.16))
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
-                        }
-                        Text(row.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(.vertical, 5)
-                    .tag(row.id)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Codex Manager")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text("\(profileCount) saved profiles")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(store.rows) { row in
+                        ProfileCardButton(
+                            row: row,
+                            isSelected: store.selectedID == row.id
+                        ) {
+                            store.selectedID = row.id
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
             }
             .onReceive(store.$selectedID.dropFirst()) { _ in
                 store.revealToken = false
                 store.loadSelected()
             }
 
+            capturePanel
+            statusPanel
+            utilityButtons
+        }
+        .padding(18)
+        .frame(width: 320)
+        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.46))
+    }
+
+    private var capturePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Capture current login", systemImage: "plus.circle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+
             HStack {
-                TextField("profile-name", text: $store.newProfileName)
+                TextField("profile name", text: $store.newProfileName)
                     .textFieldStyle(.roundedBorder)
-                Button("Capture") {
+                Button {
                     store.captureCurrent()
+                } label: {
+                    Label("Capture", systemImage: "tray.and.arrow.down.fill")
                 }
                 .disabled(store.isWorking)
             }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
 
+    private var statusPanel: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: messageIcon)
+                .foregroundStyle(messageColor)
+                .frame(width: 18)
             Text(store.message)
                 .font(.caption)
-                .foregroundStyle(store.message.lowercased().contains("failed") || store.message.lowercased().contains("khong") ? .red : .secondary)
-                .lineLimit(3)
-
-            Spacer()
+                .foregroundStyle(messageColor)
+                .lineLimit(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(18)
-        .frame(width: 280)
+        .padding(10)
+        .background(messageColor.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var utilityButtons: some View {
+        VStack(spacing: 8) {
+            Button {
+                store.openCodex()
+            } label: {
+                Label("Open Codex", systemImage: "arrow.up.forward.app")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Button {
+                store.openProfilesFolder()
+            } label: {
+                Label("Profiles Folder", systemImage: "folder")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .buttonStyle(.bordered)
     }
 
     private var detail: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(store.selectedMetadata.profileName)
-                        .font(.title.weight(.semibold))
-                    Text(store.selectedMetadata.authURL.path)
-                        .font(.caption)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                headerPanel
+                actionPanel
+                metadataPanel
+                tokenVault
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private var headerPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: selectedIcon)
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(selectedIconColor)
+                    .frame(width: 54, height: 54)
+                    .background(selectedIconColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(store.selectedMetadata.profileName)
+                            .font(.system(size: 28, weight: .semibold))
+                            .lineLimit(1)
+                        if store.selectedID == store.activeProfile {
+                            StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
+                        }
+                        if store.selectedID == currentSelection {
+                            StatusPill(text: "Live auth", color: .blue, systemImage: "bolt.fill")
+                        }
+                    }
+
+                    Text(selectedSubtitle)
+                        .font(.system(size: 13))
                         .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+
                 Spacer()
-                Button("Refresh") {
+
+                Button {
                     store.reload()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .disabled(store.isWorking)
             }
 
-            metadataGrid
-            tokenVault
-            actionBar
-            Spacer()
+            HStack(spacing: 10) {
+                SummaryTile(title: "Auth file", value: store.selectedMetadata.exists ? "Found" : "Missing", systemImage: "doc.text.magnifyingglass", color: store.selectedMetadata.exists ? .green : .red)
+                SummaryTile(title: "Tokens", value: "\(store.selectedMetadata.tokens.count)", systemImage: "key.horizontal.fill", color: .orange)
+                SummaryTile(title: "API key", value: store.selectedMetadata.hasAPIKey ? "Present" : "None", systemImage: "terminal.fill", color: store.selectedMetadata.hasAPIKey ? .purple : .secondary)
+            }
         }
-        .padding(22)
-    }
-
-    private var metadataGrid: some View {
-        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-            metadataRow("Auth mode", store.selectedMetadata.authMode)
-            metadataRow("Email", store.selectedMetadata.email)
-            metadataRow("Account ID", store.selectedMetadata.accountID)
-            metadataRow("Last refresh", store.selectedMetadata.lastRefresh)
-            metadataRow("Captured at", store.selectedMetadata.capturedAt)
-            metadataRow("API key", store.selectedMetadata.hasAPIKey ? "Present" : "Not present")
-            metadataRow("Auth file", store.selectedMetadata.exists ? "Found" : "Missing")
-        }
-        .padding(14)
+        .padding(18)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var actionPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Account Actions")
+                .font(.headline)
+
+            HStack(spacing: 10) {
+                Button {
+                    store.switchSelected()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Switch",
+                        subtitle: "Restore selected profile",
+                        systemImage: "arrow.triangle.2.circlepath"
+                    )
+                }
+                .buttonStyle(PrimaryActionButtonStyle())
+                .disabled(store.isWorking || store.selectedID == currentSelection || store.selectedID == store.activeProfile)
+
+                Button {
+                    store.saveActiveProfile()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Save Active",
+                        subtitle: "Update full app state",
+                        systemImage: "externaldrive.fill.badge.checkmark"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .green))
+                .disabled(store.isWorking || store.activeProfile.isEmpty)
+
+                Button {
+                    store.saveActiveAuthNow()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Save Token",
+                        subtitle: "Store fresh auth only",
+                        systemImage: "key.fill"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .orange))
+                .disabled(store.isWorking || store.activeProfile.isEmpty)
+
+                Button {
+                    confirmDelete()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Delete",
+                        subtitle: "Remove saved profile",
+                        systemImage: "trash.fill"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .red))
+                .disabled(store.isWorking || store.selectedID == currentSelection || store.selectedID == store.activeProfile)
+            }
+        }
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var metadataPanel: some View {
+        SectionPanel(title: "Profile Details", systemImage: "list.bullet.rectangle") {
+            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 12) {
+                metadataRow("Auth mode", store.selectedMetadata.authMode)
+                metadataRow("Email", store.selectedMetadata.email)
+                metadataRow("Account ID", store.selectedMetadata.accountID)
+                metadataRow("Last refresh", store.selectedMetadata.lastRefresh)
+                metadataRow("Captured at", store.selectedMetadata.capturedAt)
+                metadataRow("Auth path", store.selectedMetadata.authURL.path)
+            }
+        }
     }
 
     private func metadataRow(_ title: String, _ value: String) -> some View {
         GridRow {
             Text(title)
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 92, alignment: .leading)
+                .frame(width: 96, alignment: .leading)
             Text(value)
+                .font(.system(size: 13))
                 .textSelection(.enabled)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -633,78 +779,87 @@ struct ManagerView: View {
     }
 
     private var tokenVault: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Token Vault")
-                    .font(.headline)
-                Spacer()
-                Picker("Token", selection: $store.selectedTokenKey) {
-                    ForEach(store.selectedMetadata.tokens.keys.sorted(), id: \.self) { key in
-                        let length = store.selectedMetadata.tokenLengths[key] ?? 0
-                        Text("\(store.friendlyTokenName(key)) (\(length))").tag(key)
+        SectionPanel(title: "Token Vault", systemImage: "lock.shield.fill") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Picker("Token", selection: $store.selectedTokenKey) {
+                        ForEach(store.selectedMetadata.tokens.keys.sorted(), id: \.self) { key in
+                            let length = store.selectedMetadata.tokenLengths[key] ?? 0
+                            Text("\(store.friendlyTokenName(key)) (\(length))").tag(key)
+                        }
                     }
-                }
-                .labelsHidden()
-                .frame(width: 190)
-                Toggle("Reveal", isOn: $store.revealToken)
-                    .toggleStyle(.checkbox)
-                Button("Copy") {
-                    store.copySelectedToken()
-                }
-                .disabled(store.selectedMetadata.tokens[store.selectedTokenKey] == nil)
-            }
+                    .frame(width: 210)
 
-            ScrollView {
-                Text(store.tokenDisplay())
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-            }
-            .frame(height: 132)
-            .background(Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Toggle("Reveal token", isOn: $store.revealToken)
+                        .toggleStyle(.checkbox)
 
-            Text("Tokens stay local. The app never prints them to terminal, logs, or network.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                    Spacer()
+
+                    Button {
+                        store.copySelectedToken()
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    .disabled(store.selectedMetadata.tokens[store.selectedTokenKey] == nil)
+                }
+
+                ScrollView {
+                    Text(store.tokenDisplay())
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                .frame(height: 132)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .foregroundStyle(.green)
+                    Text("Tokens stay local and are hidden by default. They are never printed to terminal, logs, or network.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
-        .padding(14)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var actionBar: some View {
-        HStack {
-            Button("Switch to Selected") {
-                store.switchSelected()
-            }
-            .disabled(store.isWorking || store.selectedID == currentSelection || store.selectedID == store.activeProfile)
+    private var profileCount: Int {
+        store.rows.filter { !$0.isCurrentAuth }.count
+    }
 
-            Button("Save Active") {
-                store.saveActiveProfile()
-            }
-            .disabled(store.isWorking || store.activeProfile.isEmpty)
-
-            Button("Save Token") {
-                store.saveActiveAuthNow()
-            }
-            .disabled(store.isWorking || store.activeProfile.isEmpty)
-
-            Button("Delete Selected") {
-                confirmDelete()
-            }
-            .disabled(store.isWorking || store.selectedID == currentSelection || store.selectedID == store.activeProfile)
-
-            Spacer()
-
-            Button("Open Codex") {
-                store.openCodex()
-            }
-            Button("Profiles Folder") {
-                store.openProfilesFolder()
-            }
+    private var selectedSubtitle: String {
+        if store.selectedMetadata.email != "-" {
+            return store.selectedMetadata.email
         }
+        if store.selectedMetadata.accountID != "-" {
+            return store.selectedMetadata.accountID
+        }
+        return store.selectedMetadata.authURL.path
+    }
+
+    private var selectedIcon: String {
+        store.selectedID == currentSelection ? "bolt.circle.fill" : "person.crop.circle.fill"
+    }
+
+    private var selectedIconColor: Color {
+        store.selectedID == currentSelection ? .blue : .indigo
+    }
+
+    private var messageColor: Color {
+        let lower = store.message.lowercased()
+        if lower.contains("failed") || lower.contains("error") || lower.contains("khong") || lower.contains("cannot") {
+            return .red
+        }
+        if lower.contains("saved") || lower.contains("captured") || lower.contains("switched") || lower.contains("copied") {
+            return .green
+        }
+        return .secondary
+    }
+
+    private var messageIcon: String {
+        messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill"
     }
 
     private func confirmDelete() {
@@ -717,6 +872,170 @@ struct ManagerView: View {
         if alert.runModal() == .alertFirstButtonReturn {
             store.deleteSelected()
         }
+    }
+}
+
+private struct ProfileCardButton: View {
+    let row: ProfileRow
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: row.isCurrentAuth ? "bolt.circle.fill" : "person.crop.circle")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 30, height: 30)
+                    .background(iconColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(row.name)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if row.isActive {
+                            StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
+                        }
+                    }
+                    Text(row.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(cardBackground)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor.opacity(0.65) : Color(nsColor: .separatorColor).opacity(0.35), lineWidth: isSelected ? 1.3 : 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var iconColor: Color {
+        row.isCurrentAuth ? .blue : (row.isActive ? .green : .indigo)
+    }
+
+    private var cardBackground: Color {
+        isSelected ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor)
+    }
+}
+
+private struct StatusPill: View {
+    let text: String
+    let color: Color
+    let systemImage: String
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
+            .font(.system(size: 10, weight: .bold))
+            .labelStyle(.titleAndIcon)
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.13))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+    }
+}
+
+private struct SummaryTile: View {
+    let title: String
+    let value: String
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .foregroundStyle(color)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.58))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct SectionPanel<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+            content
+        }
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct ActionButtonLabel: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 18, weight: .semibold))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(subtitle)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 74, alignment: .leading)
+        .padding(12)
+    }
+}
+
+private struct PrimaryActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.white)
+            .background(Color.accentColor.opacity(configuration.isPressed ? 0.78 : 1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct SecondaryActionButtonStyle: ButtonStyle {
+    let color: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(color)
+            .background(color.opacity(configuration.isPressed ? 0.18 : 0.10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(color.opacity(0.26), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -827,12 +1146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             newWindow.isReleasedWhenClosed = false
             newWindow.collectionBehavior = [.moveToActiveSpace]
             newWindow.level = .floating
+            newWindow.minSize = NSSize(width: 980, height: 660)
             let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 80, y: 80, width: 1200, height: 800)
             let frame = NSRect(
-                x: visibleFrame.midX - 460,
-                y: visibleFrame.midY - 300,
-                width: 920,
-                height: 600
+                x: visibleFrame.midX - 540,
+                y: visibleFrame.midY - 360,
+                width: 1080,
+                height: 720
             )
             newWindow.setFrame(frame, display: true)
             window = newWindow
