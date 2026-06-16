@@ -206,3 +206,11 @@ The `build/` directory is ignored by Git.
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+## Support
+
+If Codex Account Manager saves you time or makes switching between Codex accounts less painful, consider supporting the project. Donations help keep the tool maintained, tested on newer macOS releases, and improved with safer account-management workflows.
+
+[![Support me on Ko-fi](https://storage.ko-fi.com/cdn/kofi2.png?v=3)](https://ko-fi.com/A6I721HY8E)
+
+You can also support directly here: [ko-fi.com/A6I721HY8E](https://ko-fi.com/A6I721HY8E)
