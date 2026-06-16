@@ -1,141 +1,143 @@
 # Codex Account Manager
 
-Ứng dụng macOS local-first để quản lý nhiều account Codex Desktop trên cùng một máy Mac. App giúp bạn lưu từng account thành profile riêng, switch qua lại nhanh, xem token hiện tại khi cần debug, và tự lưu lại token mới sau khi bạn đăng nhập lại.
+Codex Account Manager is a local-first macOS app for managing multiple Codex Desktop accounts on the same Mac. It lets you save each signed-in Codex session as a local profile, switch between profiles quickly, inspect auth metadata, and recover from revoked refresh tokens without manually copying `auth.json`.
 
-Codex Account Manager được thiết kế cho workflow dùng nhiều tài khoản như personal, work, team hoặc client account mà không phải tự copy `auth.json` thủ công.
+The project is designed for people who regularly move between personal, work, team, or client Codex accounts and want a safer workflow than hand-editing local auth files.
 
-## Điểm nổi bật
+## Highlights
 
-- Quản lý nhiều profile Codex trên macOS.
-- Switch account Codex Desktop chỉ bằng một nút.
-- Lưu và khôi phục `~/.codex/auth.json`.
-- Lưu và khôi phục state của Codex Desktop tại `~/Library/Application Support/Codex`.
-- Xem metadata account: auth mode, email/account id, thời điểm refresh token.
-- Token Vault có chế độ ẩn token mặc định, reveal thủ công và copy vào clipboard.
-- Tự động lưu token mới vào active profile sau khi bạn đăng nhập lại.
-- Chạy hoàn toàn local, không gửi token hoặc profile data lên server.
+- Manage multiple Codex Desktop profiles on macOS.
+- Switch accounts with one click.
+- Save and restore `~/.codex/auth.json`.
+- Save and restore Codex Desktop state from `~/Library/Application Support/Codex`.
+- Inspect profile metadata such as auth mode, email/account id, and refresh time.
+- Use Token Vault to reveal or copy tokens only when you explicitly choose to.
+- Automatically save fresh tokens into the active profile after you sign in again.
+- Run fully locally. No token or profile data is uploaded anywhere.
 
-## Yêu cầu
+## Requirements
 
 - macOS.
-- Đã cài Codex Desktop App.
-- Đã có Swift compiler, thường đi kèm Xcode Command Line Tools.
+- OpenAI Codex Desktop App.
+- Swift compiler, usually installed with Xcode Command Line Tools.
 
-Kiểm tra Swift:
+Check Swift:
 
 ```bash
 swift --version
 ```
 
-Nếu chưa có Command Line Tools:
+Install Xcode Command Line Tools if needed:
 
 ```bash
 xcode-select --install
 ```
 
-## Cài đặt
+## Installation
 
-Clone repo:
+Clone the repository:
 
 ```bash
 git clone https://github.com/ngnthanhdev/codex-account-manager.git
 cd codex-account-manager
 ```
 
-Build app:
+Build the app:
 
 ```bash
 chmod +x build-app.sh codex-account-switcher.sh
 ./build-app.sh
 ```
 
-Mở app:
+Open the app:
 
 ```bash
 open "build/Codex Account Switcher.app"
 ```
 
-Sau khi mở, app sẽ hiện cửa sổ **Codex Account Manager**. Nếu cửa sổ chưa hiện, bấm app trên Dock hoặc chọn menu **Window > Show Manager**.
+After launch, the **Codex Account Manager** window should appear. If it does not, click the app in the Dock or choose **Window > Show Manager** from the macOS menu bar.
 
-## Cách sử dụng
+## Usage
 
-### 1. Lưu account đầu tiên
+### 1. Save Your First Account
 
-1. Mở Codex Desktop.
-2. Đăng nhập account đầu tiên.
-3. Mở Codex Account Manager.
-4. Nhập tên profile, ví dụ:
+1. Open Codex Desktop.
+2. Sign in with your first account.
+3. Open Codex Account Manager.
+4. Enter a profile name, for example:
 
 ```text
 personal
 ```
 
-5. Bấm **Capture**.
+5. Click **Capture**.
 
-App sẽ lưu login state hiện tại thành profile `personal`.
+The current Codex login state is now saved as the `personal` profile.
 
-### 2. Thêm account khác
+### 2. Add Another Account
 
-1. Trong Codex Desktop, log out account hiện tại.
-2. Đăng nhập account khác.
-3. Quay lại Codex Account Manager.
-4. Nhập tên profile mới, ví dụ:
+1. In Codex Desktop, log out of the current account.
+2. Sign in with another account.
+3. Return to Codex Account Manager.
+4. Enter another profile name, for example:
 
 ```text
 work
 ```
 
-5. Bấm **Capture**.
+5. Click **Capture**.
 
-### 3. Switch account
+### 3. Switch Accounts
 
-1. Chọn profile trong danh sách bên trái.
-2. Bấm **Switch to Selected**.
+1. Select a saved profile from the left sidebar.
+2. Click **Switch to Selected**.
 
-Khi switch, app sẽ:
+When switching, the app will:
 
 - Quit Codex Desktop.
-- Lưu state hiện tại vào active profile.
-- Khôi phục profile được chọn.
-- Mở lại Codex Desktop.
+- Save the current state into the active profile.
+- Restore the selected profile.
+- Open Codex Desktop again.
 
 ## Token Vault
 
-Token Vault đọc token từ `auth.json` của profile đang chọn.
+Token Vault reads tokens from the selected profile's `auth.json`.
 
-- Token luôn bị ẩn mặc định.
-- Bật **Reveal** để xem token.
-- Bấm **Copy** để copy token đang chọn vào clipboard.
-- Token không được in ra terminal, không ghi log, không gửi qua network.
+- Tokens are hidden by default.
+- Enable **Reveal** to view the selected token inside the app.
+- Click **Copy** to copy the selected token to the macOS clipboard.
+- Tokens are not printed to terminal, written to logs, or sent over the network.
 
-Các token thường thấy:
+Common token fields:
 
 - `access_token`
 - `refresh_token`
 - `id_token`
 
-## Xử lý lỗi refresh token bị revoke
+## Revoked Refresh Tokens
 
-Nếu Codex báo lỗi:
+If Codex shows this error:
 
 ```text
 Your access token could not be refreshed because your refresh token was revoked.
 Please log out and sign in again.
 ```
 
-nghĩa là refresh token trong profile đó đã bị OpenAI revoke. App không thể tự refresh một token đã bị revoke. Cách xử lý:
+the saved profile contains a refresh token that OpenAI has revoked. Codex Account Manager cannot refresh a revoked token. You need to sign in again so Codex can create a fresh token.
 
-1. Switch tới profile bị lỗi.
-2. Trong Codex Desktop, log out.
-3. Đăng nhập lại đúng account đó.
-4. Đợi vài giây, app sẽ tự lưu token mới vào active profile.
-5. Nếu muốn lưu ngay, bấm **Save Token**.
+Recovery flow:
 
-Nếu bạn cũng muốn cập nhật lại toàn bộ state Codex Desktop sau khi login lại, bấm **Save Active**.
+1. Switch to the broken profile.
+2. In Codex Desktop, log out.
+3. Sign in again with the same account.
+4. Keep Codex Account Manager open for a few seconds. It will auto-save the fresh token into the active profile.
+5. To save immediately, click **Save Token**.
+
+If you also want to refresh the saved Codex Desktop app state after signing in again, click **Save Active**.
 
 ## CLI
 
-App sử dụng script local `codex-account-switcher.sh` phía sau. Bạn cũng có thể dùng trực tiếp:
+The app uses the local `codex-account-switcher.sh` script under the hood. You can also run it directly:
 
 ```bash
 ./codex-account-switcher.sh capture personal
@@ -145,32 +147,32 @@ App sử dụng script local `codex-account-switcher.sh` phía sau. Bạn cũng 
 ./codex-account-switcher.sh active
 ```
 
-## Đóng góp
+## Contributing
 
-Bug fix và cải thiện dự án được welcome qua pull request.
+Bug fixes and improvements are welcome through pull requests.
 
-- Báo bug bằng GitHub Issues.
-- Gửi fix bằng Pull Request vào branch `main`.
-- Không gửi token, `auth.json`, cookie, profile folder hoặc dữ liệu đăng nhập thật.
-- Xem chi tiết trong [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report bugs with GitHub Issues.
+- Send fixes through Pull Requests into `main`.
+- Never include tokens, `auth.json`, cookies, profile folders, or real login data.
+- See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide.
 
-Để mọi thay đổi đều cần owner review trước khi merge, bật branch protection cho `main` trong GitHub:
+To require owner review before changes are merged, enable branch protection for `main` on GitHub:
 
-1. Vào **Settings > Branches**.
-2. Tạo rule cho branch `main`.
-3. Bật **Require a pull request before merging**.
-4. Bật **Require approvals**.
-5. Bật **Require review from Code Owners**.
+1. Go to **Settings > Branches**.
+2. Add a rule for `main`.
+3. Enable **Require a pull request before merging**.
+4. Enable **Require approvals**.
+5. Enable **Require review from Code Owners**.
 
-## Dữ liệu local
+## Local Data
 
-Profile được lưu tại:
+Profiles are stored at:
 
 ```text
 ~/Library/Application Support/CodexAccountSwitcher
 ```
 
-Cấu trúc mỗi profile:
+Each profile uses this structure:
 
 ```text
 profiles/<name>/auth/auth.json
@@ -178,29 +180,29 @@ profiles/<name>/app-support/Codex
 profiles/<name>/profile.env
 ```
 
-Không commit hoặc chia sẻ thư mục profile này. Nó chứa token, cookie và state đăng nhập của Codex Desktop.
+Do not commit or share this profile folder. It contains tokens, cookies, and Codex Desktop login state.
 
-## Bảo mật
+## Security
 
-Codex Account Manager là app local-only:
+Codex Account Manager is local-first:
 
-- Không upload token.
-- Không gửi request đến server riêng.
-- Không lưu token vào Git.
-- Không log token ra file hoặc terminal.
+- It does not upload tokens.
+- It does not send profile data to a custom server.
+- It does not store tokens in Git.
+- It does not log token values to files or terminal output.
 
-Bạn vẫn nên coi profile folder là dữ liệu nhạy cảm, giống như password hoặc browser session.
+Treat the profile folder as sensitive data, just like a password manager export or a browser session.
 
-## Build output
+## Build Output
 
-Sau khi build thành công:
+After a successful build:
 
 ```text
 build/Codex Account Switcher.app
 ```
 
-Thư mục `build/` được ignore khỏi Git.
+The `build/` directory is ignored by Git.
 
 ## License
 
-MIT License. Xem [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
