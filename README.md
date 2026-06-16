@@ -145,6 +145,23 @@ App sử dụng script local `codex-account-switcher.sh` phía sau. Bạn cũng 
 ./codex-account-switcher.sh active
 ```
 
+## Đóng góp
+
+Bug fix và cải thiện dự án được welcome qua pull request.
+
+- Báo bug bằng GitHub Issues.
+- Gửi fix bằng Pull Request vào branch `main`.
+- Không gửi token, `auth.json`, cookie, profile folder hoặc dữ liệu đăng nhập thật.
+- Xem chi tiết trong [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Để mọi thay đổi đều cần owner review trước khi merge, bật branch protection cho `main` trong GitHub:
+
+1. Vào **Settings > Branches**.
+2. Tạo rule cho branch `main`.
+3. Bật **Require a pull request before merging**.
+4. Bật **Require approvals**.
+5. Bật **Require review from Code Owners**.
+
 ## Dữ liệu local
 
 Profile được lưu tại:
@@ -186,4 +203,4 @@ Thư mục `build/` được ignore khỏi Git.
 
 ## License
 
-Personal/internal tool. Bạn có thể chỉnh sửa và dùng theo nhu cầu của mình.
+MIT License. Xem [LICENSE](LICENSE).
