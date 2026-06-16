@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let currentSelection = "__current_codex_auth__"
 
@@ -100,6 +101,8 @@ final class AccountStore: ObservableObject {
     @Published var privacyMode: Bool
     @Published var aliasDraft: String = ""
     @Published var isEditingAlias: Bool = false
+    @Published var profileNameDraft: String = ""
+    @Published var isEditingProfileName: Bool = false
     @Published var isWorking: Bool = false
     @Published var message: String = "Ready"
 
@@ -216,6 +219,8 @@ final class AccountStore: ObservableObject {
         }
         aliasDraft = selectedMetadata.alias
         isEditingAlias = false
+        profileNameDraft = selectedID == currentSelection ? "" : selectedID
+        isEditingProfileName = false
     }
 
     func togglePrivacyMode() {
@@ -257,14 +262,47 @@ final class AccountStore: ObservableObject {
         isEditingAlias = false
     }
 
+    func renameSelectedProfile() {
+        guard selectedID != currentSelection else {
+            message = "Current Codex cannot be renamed. Capture it as a profile first."
+            return
+        }
+        let oldName = selectedID
+        let cleaned = profileNameDraft
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            message = "Enter a new profile name before renaming."
+            return
+        }
+        guard cleaned != oldName else {
+            isEditingProfileName = false
+            return
+        }
+        guard isValidProfileName(cleaned) else {
+            message = "Profile names may only use letters, numbers, dots, dashes, and underscores."
+            return
+        }
+        perform(["rename", oldName, cleaned], successMessage: "Renamed \(oldName) to \(cleaned)") {
+            self.selectedID = cleaned
+            self.profileNameDraft = cleaned
+            self.isEditingProfileName = false
+        }
+    }
+
+    func cancelProfileRename() {
+        profileNameDraft = selectedID == currentSelection ? "" : selectedID
+        isEditingProfileName = false
+    }
+
     func captureCurrent() {
         let trimmed = newProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            message = "Nhap ten profile truoc khi capture."
+            message = "Enter a profile name before capturing."
             return
         }
         guard isValidProfileName(trimmed) else {
-            message = "Profile chi duoc dung chu, so, dot, dash, underscore."
+            message = "Profile names may only use letters, numbers, dots, dashes, and underscores."
             return
         }
         perform(["capture", trimmed], successMessage: "Captured \(trimmed)") {
@@ -275,11 +313,11 @@ final class AccountStore: ObservableObject {
 
     func switchSelected() {
         guard selectedID != currentSelection else {
-            message = "Chon mot saved profile de switch."
+            message = "Choose a saved profile to switch."
             return
         }
         guard selectedID != activeProfile else {
-            message = "\(selectedID) dang la active profile."
+            message = "\(selectedID) is already the active profile."
             return
         }
         perform(["switch", selectedID], successMessage: "Switched to \(selectedID)")
@@ -287,7 +325,7 @@ final class AccountStore: ObservableObject {
 
     func saveActiveProfile() {
         guard !activeProfile.isEmpty else {
-            message = "Chua co active profile. Capture current truoc."
+            message = "No active profile yet. Capture the current login first."
             return
         }
         perform(["capture", activeProfile], successMessage: "Saved \(activeProfile)")
@@ -295,7 +333,7 @@ final class AccountStore: ObservableObject {
 
     func saveActiveAuthNow() {
         guard !activeProfile.isEmpty else {
-            message = "Chua co active profile. Capture current truoc."
+            message = "No active profile yet. Capture the current login first."
             return
         }
         perform(["save-auth", activeProfile], successMessage: "Saved fresh token into \(activeProfile)")
@@ -303,17 +341,65 @@ final class AccountStore: ObservableObject {
 
     func deleteSelected() {
         guard selectedID != currentSelection else {
-            message = "Khong the delete Current Codex."
+            message = "Current Codex cannot be deleted."
             return
         }
         guard selectedID != activeProfile else {
-            message = "Khong the delete active profile. Switch sang profile khac truoc."
+            message = "The active profile cannot be deleted. Switch to another profile first."
             return
         }
         let deleting = selectedID
         perform(["delete", deleting], successMessage: "Deleted \(deleting)") {
             self.selectedID = currentSelection
         }
+    }
+
+    func importAuthFile() {
+        let trimmed = newProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            message = "Enter a profile name before importing auth.json."
+            return
+        }
+        guard isValidProfileName(trimmed) else {
+            message = "Profile names may only use letters, numbers, dots, dashes, and underscores."
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "Import auth.json"
+        panel.prompt = "Import"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else {
+            message = "Import cancelled."
+            return
+        }
+
+        perform(["import-auth", trimmed, url.path], successMessage: "Imported auth.json as \(trimmed)") {
+            self.selectedID = trimmed
+            self.newProfileName = ""
+        }
+    }
+
+    func exportSelectedProfile() {
+        guard selectedID != currentSelection else {
+            message = "Choose a saved profile to export a backup."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Profile Backup"
+        panel.prompt = "Export"
+        panel.nameFieldStringValue = "\(selectedID).codex-profile.zip"
+        panel.allowedContentTypes = [.zip]
+        guard panel.runModal() == .OK, let url = panel.url else {
+            message = "Export cancelled."
+            return
+        }
+
+        perform(["export-profile", selectedID, url.path], successMessage: "Exported \(selectedID) backup. Keep it private; it contains auth data.")
     }
 
     func openProfilesFolder() {
@@ -329,7 +415,7 @@ final class AccountStore: ObservableObject {
 
     func copySelectedToken() {
         guard let token = selectedMetadata.tokens[selectedTokenKey], !token.isEmpty else {
-            message = "Khong co token nay trong auth.json."
+            message = "This token is not available in auth.json."
             return
         }
         NSPasteboard.general.clearContents()
@@ -915,7 +1001,7 @@ struct ManagerView: View {
 
     private var capturePanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Capture current login", systemImage: "plus.circle.fill")
+            Label("Add profile", systemImage: "plus.circle.fill")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.primary)
 
@@ -929,6 +1015,15 @@ struct ManagerView: View {
                 }
                 .disabled(store.isWorking)
             }
+
+            Button {
+                store.importAuthFile()
+            } label: {
+                Label("Import auth.json", systemImage: "square.and.arrow.down")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isWorking)
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -983,6 +1078,7 @@ struct ManagerView: View {
                 headerPanel
                 actionPanel
                 tokenStatusPanel
+                importExportPanel
                 metadataPanel
                 tokenVault
             }
@@ -1018,6 +1114,8 @@ struct ManagerView: View {
                         .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
+
+                    profileNameControl
                 }
 
                 Spacer()
@@ -1078,6 +1176,50 @@ struct ManagerView: View {
                     .buttonStyle(.borderless)
                     .help("Edit local alias")
                 }
+            }
+        }
+    }
+
+    private var profileNameControl: some View {
+        HStack(spacing: 6) {
+            if store.selectedID == currentSelection {
+                Label("Live Codex auth", systemImage: "bolt.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if store.isEditingProfileName {
+                TextField("Profile name", text: $store.profileNameDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 220)
+                    .onSubmit {
+                        store.renameSelectedProfile()
+                    }
+                Button {
+                    store.renameSelectedProfile()
+                } label: {
+                    Image(systemName: "checkmark")
+                }
+                .buttonStyle(.borderless)
+                .disabled(store.isWorking)
+                Button {
+                    store.cancelProfileRename()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+            } else {
+                Text("Profile ID: \(store.selectedID)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Button {
+                    store.profileNameDraft = store.selectedID
+                    store.isEditingProfileName = true
+                } label: {
+                    Label("Rename", systemImage: "text.cursor")
+                }
+                .font(.caption)
+                .buttonStyle(.link)
+                .disabled(store.isWorking)
             }
         }
     }
@@ -1155,6 +1297,56 @@ struct ManagerView: View {
                 metadataRow("Captured at", store.selectedMetadata.capturedAt)
                 metadataRow("Desktop state", store.selectedMetadata.desktopState)
                 metadataRow("Auth path", store.selectedMetadata.authURL.path)
+            }
+        }
+    }
+
+    private var importExportPanel: some View {
+        SectionPanel(title: "Backup & Import", systemImage: "archivebox.fill") {
+            HStack(spacing: 10) {
+                Button {
+                    store.exportSelectedProfile()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Export Backup",
+                        subtitle: "Zip selected profile",
+                        systemImage: "square.and.arrow.up.fill"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .blue))
+                .disabled(store.isWorking || store.selectedID == currentSelection)
+
+                Button {
+                    store.importAuthFile()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Import Auth",
+                        subtitle: "Create auth-only profile",
+                        systemImage: "doc.badge.plus"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .purple))
+                .disabled(store.isWorking)
+
+                Button {
+                    store.openProfilesFolder()
+                } label: {
+                    ActionButtonLabel(
+                        title: "Profiles Folder",
+                        subtitle: "Open local store",
+                        systemImage: "folder.fill"
+                    )
+                }
+                .buttonStyle(SecondaryActionButtonStyle(color: .gray))
+                .disabled(store.isWorking)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "lock.shield.fill")
+                    .foregroundStyle(.orange)
+                Text("Backups are local zip files and include sensitive auth data. Store them somewhere private.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -1642,6 +1834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem(title: "Open Manager", action: #selector(openManager), keyEquivalent: "m"))
         menu.addItem(NSMenuItem(title: "Capture Current...", action: #selector(openManager), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Codex", action: #selector(menuOpenCodex), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
         for row in store.rows where !row.isCurrentAuth {
@@ -1653,6 +1846,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
 
+        menu.addItem(NSMenuItem.separator())
+        let saveActiveItem = NSMenuItem(title: "Save Active State", action: #selector(menuSaveActiveState), keyEquivalent: "")
+        saveActiveItem.isEnabled = !store.activeProfile.isEmpty && !store.isWorking
+        menu.addItem(saveActiveItem)
+        let saveTokenItem = NSMenuItem(title: "Save Fresh Token", action: #selector(menuSaveFreshToken), keyEquivalent: "")
+        saveTokenItem.isEnabled = !store.activeProfile.isEmpty && !store.isWorking
+        menu.addItem(saveTokenItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Refresh", action: #selector(menuRefresh), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Open Profiles Folder", action: #selector(menuOpenFolder), keyEquivalent: ""))
@@ -1711,6 +1911,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func menuRefresh() {
         rebuildMenu()
+    }
+
+    @objc private func menuOpenCodex() {
+        store.openCodex()
+    }
+
+    @objc private func menuSaveActiveState() {
+        store.saveActiveProfile()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.rebuildMenu()
+        }
+    }
+
+    @objc private func menuSaveFreshToken() {
+        store.saveActiveAuthNow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.rebuildMenu()
+        }
     }
 
     @objc private func menuOpenFolder() {

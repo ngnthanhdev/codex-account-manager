@@ -22,6 +22,9 @@ Usage:
   codex-account-switcher.sh switch <profile> [--no-open]
   codex-account-switcher.sh list [--plain]
   codex-account-switcher.sh active
+  codex-account-switcher.sh rename <old-profile> <new-profile>
+  codex-account-switcher.sh import-auth <profile> <auth-json>
+  codex-account-switcher.sh export-profile <profile> <zip-path>
   codex-account-switcher.sh delete <profile>
   codex-account-switcher.sh open-folder
 
@@ -300,6 +303,83 @@ cmd_active() {
   active_profile || true
 }
 
+cmd_rename() {
+  local old_name="${1:-}"
+  local new_name="${2:-}"
+  validate_profile_name "$old_name"
+  validate_profile_name "$new_name"
+  with_lock
+
+  local old_dir new_dir
+  old_dir="$(profile_dir "$old_name")"
+  new_dir="$(profile_dir "$new_name")"
+
+  [[ -d "$old_dir" ]] || fail "profile '$old_name' does not exist"
+  [[ ! -e "$new_dir" ]] || fail "profile '$new_name' already exists"
+
+  mv "$old_dir" "$new_dir"
+  {
+    printf 'name=%s\n' "$new_name"
+    if [[ -f "$new_dir/profile.env" ]]; then
+      grep -v '^name=' "$new_dir/profile.env" || true
+    fi
+  } > "$new_dir/profile.env.tmp"
+  mv "$new_dir/profile.env.tmp" "$new_dir/profile.env"
+
+  local active
+  active="$(active_profile || true)"
+  if [[ "$active" == "$old_name" ]]; then
+    printf '%s\n' "$new_name" > "$ACTIVE_FILE"
+  fi
+
+  log "renamed profile '$old_name' to '$new_name'"
+}
+
+cmd_import_auth() {
+  local name="${1:-}"
+  local auth_json="${2:-}"
+  validate_profile_name "$name"
+  [[ -n "$auth_json" ]] || fail "auth.json path is required"
+  [[ -s "$auth_json" ]] || fail "auth.json file is missing or empty"
+  with_lock
+
+  local dir
+  dir="$(profile_dir "$name")"
+  [[ ! -e "$dir" ]] || fail "profile '$name' already exists"
+
+  mkdir -p "$dir/auth" "$dir/app-support"
+  cp -p "$auth_json" "$(profile_auth_file "$name")"
+  chmod 600 "$(profile_auth_file "$name")" 2>/dev/null || true
+
+  {
+    printf 'name=%s\n' "$name"
+    printf 'captured_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'auth_file=%s\n' "$auth_json"
+    printf 'app_support=%s\n' "$CODEX_APP_SUPPORT"
+    printf 'imported_auth_only=true\n'
+  } > "$dir/profile.env"
+
+  log "imported auth.json as profile '$name'"
+}
+
+cmd_export_profile() {
+  local name="${1:-}"
+  local zip_path="${2:-}"
+  validate_profile_name "$name"
+  [[ -n "$zip_path" ]] || fail "zip path is required"
+  ensure_store
+
+  local dir
+  dir="$(profile_dir "$name")"
+  [[ -d "$dir" ]] || fail "profile '$name' does not exist"
+
+  mkdir -p "$(dirname "$zip_path")"
+  rm -f "$zip_path"
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$dir" "$zip_path"
+  chmod 600 "$zip_path" 2>/dev/null || true
+  log "exported profile '$name' to '$zip_path'"
+}
+
 cmd_delete() {
   local name="${1:-}"
   validate_profile_name "$name"
@@ -334,6 +414,9 @@ main() {
     switch) cmd_switch "$@" ;;
     list) cmd_list "$@" ;;
     active) cmd_active ;;
+    rename) cmd_rename "$@" ;;
+    import-auth) cmd_import_auth "$@" ;;
+    export-profile) cmd_export_profile "$@" ;;
     delete) cmd_delete "$@" ;;
     open-folder) cmd_open_folder ;;
     -h|--help|help|"") usage ;;

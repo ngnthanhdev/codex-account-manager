@@ -1,0 +1,64 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS app
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Validate shell script
+        run: bash -n codex-account-switcher.sh
+
+      - name: Build app
+        run: ./build-app.sh
+
+      - name: Resolve package name
+        run: |
+          set -euo pipefail
+          safe_ref="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+          printf 'PACKAGE_NAME=Codex-Account-Switcher-%s\n' "$safe_ref" >> "$GITHUB_ENV"
+
+      - name: Package app
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/Codex Account Switcher.app" \
+            "dist/${PACKAGE_NAME}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "Codex Account Manager $GITHUB_REF_NAME" \
+            --notes "Built from $GITHUB_SHA."

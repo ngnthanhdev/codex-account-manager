@@ -13,6 +13,9 @@ The project is designed for people who regularly move between personal, work, te
 - Inspect profile metadata such as auth mode, email/account id, plan, workspace, seat type, and refresh time.
 - See profile health at a glance, including missing auth, invalid auth, expired access tokens, and auth-only profiles.
 - Add local aliases to profiles so accounts with similar emails are easier to distinguish.
+- Rename saved profile IDs from the app.
+- Import an existing `auth.json` as an auth-only profile.
+- Export a selected profile as a local zip backup.
 - Hide sensitive account details while screen sharing.
 - Use Token Vault to reveal or copy tokens only when you explicitly choose to.
 - Review token status for access, refresh, and ID tokens without revealing token values.
@@ -24,7 +27,8 @@ The project is designed for people who regularly move between personal, work, te
 The latest UI refresh adds a clearer account-management view inspired by operational dashboards while staying native to macOS:
 
 - Profile cards now show health badges and account context, such as plan and workspace.
-- The detail view includes editable local aliases, privacy controls, token health, and richer auth metadata.
+- The detail view includes editable local aliases, profile rename controls, privacy controls, token health, and richer auth metadata.
+- The account workflow now includes auth import, local profile backup export, and faster menu bar actions inspired by tray-first account switchers.
 - Token parsing is more tolerant of Codex auth format changes, including both snake_case and camelCase token keys.
 - Saved aliases are preserved when an existing profile is captured again.
 
@@ -156,6 +160,9 @@ The app uses the local `codex-account-switcher.sh` script under the hood. You ca
 ./codex-account-switcher.sh capture personal
 ./codex-account-switcher.sh switch work
 ./codex-account-switcher.sh save-auth personal
+./codex-account-switcher.sh rename personal personal-main
+./codex-account-switcher.sh import-auth client ~/Downloads/auth.json
+./codex-account-switcher.sh export-profile work ~/Desktop/work.codex-profile.zip
 ./codex-account-switcher.sh list
 ./codex-account-switcher.sh active
 ```
@@ -195,6 +202,8 @@ profiles/<name>/profile.env
 
 Do not commit or share this profile folder. It contains tokens, cookies, and Codex Desktop login state.
 
+Profile backup zip files exported by the app contain the same sensitive data. Store them privately and delete old backups when you no longer need them.
+
 ## Security
 
 Codex Account Manager is local-first:
@@ -215,6 +224,27 @@ build/Codex Account Switcher.app
 ```
 
 The `build/` directory is ignored by Git.
+
+## Release Pipeline
+
+GitHub Actions builds the macOS app on every push or pull request to `main`.
+
+To publish a release, push a version tag:
+
+```bash
+git tag v0.2.1
+git push origin v0.2.1
+```
+
+The release workflow will:
+
+- Validate `codex-account-switcher.sh`.
+- Build `build/Codex Account Switcher.app`.
+- Package the app as a zip file.
+- Create a GitHub Release for tags that start with `v`.
+- Upload the zip as a release asset.
+
+The release asset is currently unsigned and not notarized. macOS may show a Gatekeeper warning until code signing and notarization are added.
 
 ## License
 
