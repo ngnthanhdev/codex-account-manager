@@ -79,6 +79,15 @@ active_profile() {
   fi
 }
 
+profile_env_value() {
+  local name="$1"
+  local key="$2"
+  local env_file
+  env_file="$(profile_dir "$name")/profile.env"
+  [[ -f "$env_file" ]] || return 0
+  grep -m 1 "^${key}=" "$env_file" | sed "s/^${key}=//" || true
+}
+
 copy_file_if_present() {
   local src="$1"
   local dst="$2"
@@ -145,6 +154,8 @@ capture_into_profile() {
 
   local dir
   dir="$(profile_dir "$name")"
+  local existing_alias
+  existing_alias="$(profile_env_value "$name" "local_alias")"
   mkdir -p "$dir/auth" "$dir/app-support"
 
   copy_file_if_present "$CODEX_AUTH_FILE" "$(profile_auth_file "$name")"
@@ -155,6 +166,9 @@ capture_into_profile() {
     printf 'captured_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'auth_file=%s\n' "$CODEX_AUTH_FILE"
     printf 'app_support=%s\n' "$CODEX_APP_SUPPORT"
+    if [[ -n "$existing_alias" ]]; then
+      printf 'local_alias=%s\n' "$existing_alias"
+    fi
   } > "$dir/profile.env"
 }
 

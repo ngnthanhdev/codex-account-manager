@@ -10,10 +10,23 @@ The project is designed for people who regularly move between personal, work, te
 - Switch accounts with one click.
 - Save and restore `~/.codex/auth.json`.
 - Save and restore Codex Desktop state from `~/Library/Application Support/Codex`.
-- Inspect profile metadata such as auth mode, email/account id, and refresh time.
+- Inspect profile metadata such as auth mode, email/account id, plan, workspace, seat type, and refresh time.
+- See profile health at a glance, including missing auth, invalid auth, expired access tokens, and auth-only profiles.
+- Add local aliases to profiles so accounts with similar emails are easier to distinguish.
+- Hide sensitive account details while screen sharing.
 - Use Token Vault to reveal or copy tokens only when you explicitly choose to.
+- Review token status for access, refresh, and ID tokens without revealing token values.
 - Automatically save fresh tokens into the active profile after you sign in again.
 - Run fully locally. No token or profile data is uploaded anywhere.
+
+## What Is New
+
+The latest UI refresh adds a clearer account-management view inspired by operational dashboards while staying native to macOS:
+
+- Profile cards now show health badges and account context, such as plan and workspace.
+- The detail view includes editable local aliases, privacy controls, token health, and richer auth metadata.
+- Token parsing is more tolerant of Codex auth format changes, including both snake_case and camelCase token keys.
+- Saved aliases are preserved when an existing profile is captured again.
 
 ## Requirements
 

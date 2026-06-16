@@ -28,29 +28,65 @@ struct CommandResult {
     let output: String
 }
 
+enum ProfileHealthLevel: String {
+    case healthy
+    case warning
+    case error
+    case unknown
+}
+
+struct ProfileHealth {
+    let level: ProfileHealthLevel
+    let title: String
+    let detail: String
+    let systemImage: String
+}
+
+struct TokenStatus {
+    let key: String
+    let label: String
+    let state: String
+    let detail: String
+}
+
 struct AuthMetadata {
     let profileName: String
+    let alias: String
     let authURL: URL
     let exists: Bool
     let authMode: String
     let accountID: String
     let email: String
+    let planType: String
+    let workspaceID: String
+    let workspaceLabel: String
+    let seatType: String
     let lastRefresh: String
     let capturedAt: String
+    let desktopState: String
     let hasAPIKey: Bool
     let tokens: [String: String]
+    let tokenStatuses: [String: TokenStatus]
+    let health: ProfileHealth
 
     var tokenLengths: [String: Int] {
         tokens.mapValues { $0.count }
+    }
+
+    var displayName: String {
+        alias.isEmpty ? profileName : alias
     }
 }
 
 struct ProfileRow: Identifiable {
     let id: String
     let name: String
+    let displayName: String
     let isCurrentAuth: Bool
     let isActive: Bool
     let subtitle: String
+    let meta: String
+    let health: ProfileHealth
 }
 
 final class AccountStore: ObservableObject {
@@ -61,6 +97,9 @@ final class AccountStore: ObservableObject {
     @Published var newProfileName: String = ""
     @Published var selectedTokenKey: String = "access_token"
     @Published var revealToken: Bool = false
+    @Published var privacyMode: Bool
+    @Published var aliasDraft: String = ""
+    @Published var isEditingAlias: Bool = false
     @Published var isWorking: Bool = false
     @Published var message: String = "Ready"
 
@@ -82,6 +121,7 @@ final class AccountStore: ObservableObject {
         } else {
             scriptPath = FileManager.default.currentDirectoryPath + "/codex-account-switcher.sh"
         }
+        privacyMode = UserDefaults.standard.bool(forKey: "CodexAccountSwitcherPrivacyMode")
 
         reload()
         startAutoSaveTimer()
@@ -94,15 +134,23 @@ final class AccountStore: ObservableObject {
     static func emptyMetadata() -> AuthMetadata {
         AuthMetadata(
             profileName: "Current Codex",
+            alias: "",
             authURL: currentAuthURL(),
             exists: false,
             authMode: "-",
             accountID: "-",
             email: "-",
+            planType: "-",
+            workspaceID: "-",
+            workspaceLabel: "-",
+            seatType: "-",
             lastRefresh: "-",
             capturedAt: "-",
+            desktopState: "-",
             hasAPIKey: false,
-            tokens: [:]
+            tokens: [:],
+            tokenStatuses: [:],
+            health: ProfileHealth(level: .unknown, title: "Unknown", detail: "No auth metadata loaded.", systemImage: "questionmark.circle.fill")
         )
     }
 
@@ -123,22 +171,29 @@ final class AccountStore: ObservableObject {
             ProfileRow(
                 id: currentSelection,
                 name: "Current Codex",
+                displayName: "Current Codex",
                 isCurrentAuth: true,
                 isActive: false,
-                subtitle: authSummary(for: Self.currentAuthURL())
+                subtitle: authSummary(for: Self.currentAuthURL()),
+                meta: "Live auth file",
+                health: metadataForCurrentAuth().health
             )
         ]
 
         for name in profileNames {
             let metadata = metadata(forProfile: name)
             let label = metadata.email != "-" ? metadata.email : shortAccount(metadata.accountID)
+            let meta = profileContextLine(metadata)
             nextRows.append(
                 ProfileRow(
                     id: name,
                     name: name,
+                    displayName: metadata.displayName,
                     isCurrentAuth: false,
                     isActive: name == activeProfile,
-                    subtitle: name == activeProfile ? "Active - \(label)" : label
+                    subtitle: label,
+                    meta: meta,
+                    health: metadata.health
                 )
             )
         }
@@ -159,6 +214,47 @@ final class AccountStore: ObservableObject {
         if selectedMetadata.tokens[selectedTokenKey] == nil {
             selectedTokenKey = selectedMetadata.tokens.keys.sorted().first ?? "access_token"
         }
+        aliasDraft = selectedMetadata.alias
+        isEditingAlias = false
+    }
+
+    func togglePrivacyMode() {
+        privacyMode.toggle()
+        UserDefaults.standard.set(privacyMode, forKey: "CodexAccountSwitcherPrivacyMode")
+    }
+
+    func displaySensitive(_ value: String) -> String {
+        guard privacyMode, value != "-", !value.isEmpty else { return value }
+        if value.contains("@") {
+            let parts = value.split(separator: "@", maxSplits: 1).map(String.init)
+            let name = parts.first ?? ""
+            let domain = parts.count > 1 ? parts[1] : ""
+            return "\(String(name.prefix(2)))***@\(domain)"
+        }
+        return shortAccount(value)
+    }
+
+    func saveAlias() {
+        guard selectedID != currentSelection else {
+            message = "Current Codex cannot be aliased. Capture it as a profile first."
+            return
+        }
+        let cleaned = aliasDraft
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try writeProfileEnvValue(profile: selectedID, key: "local_alias", value: cleaned.isEmpty ? nil : cleaned)
+            message = cleaned.isEmpty ? "Cleared alias for \(selectedID)." : "Saved alias for \(selectedID)."
+            isEditingAlias = false
+            reload()
+        } catch {
+            message = "Failed to save alias: \(error.localizedDescription)"
+        }
+    }
+
+    func cancelAliasEdit() {
+        aliasDraft = selectedMetadata.alias
+        isEditingAlias = false
     }
 
     func captureCurrent() {
@@ -332,8 +428,8 @@ final class AccountStore: ObservableObject {
         guard let tokens = raw["tokens"] as? [String: Any] else {
             return false
         }
-        let hasAccess = (tokens["access_token"] as? String)?.isEmpty == false
-        let hasRefresh = (tokens["refresh_token"] as? String)?.isEmpty == false
+        let hasAccess = firstString([tokens["access_token"], tokens["accessToken"]]).isEmpty == false
+        let hasRefresh = firstString([tokens["refresh_token"], tokens["refreshToken"]]).isEmpty == false
         return hasAccess || hasRefresh
     }
 
@@ -361,7 +457,9 @@ final class AccountStore: ObservableObject {
         readAuthMetadata(
             name: "Current Codex",
             authURL: Self.currentAuthURL(),
-            capturedAt: "-"
+            capturedAt: "-",
+            alias: "",
+            desktopState: "-"
         )
     }
 
@@ -369,37 +467,76 @@ final class AccountStore: ObservableObject {
         readAuthMetadata(
             name: name,
             authURL: profileAuthURL(name),
-            capturedAt: profileCapturedAt(name)
+            capturedAt: profileEnvValue(name, key: "captured_at"),
+            alias: profileEnvValue(name, key: "local_alias", fallback: ""),
+            desktopState: profileDesktopState(name)
         )
     }
 
-    private func readAuthMetadata(name: String, authURL: URL, capturedAt: String) -> AuthMetadata {
-        guard let data = try? Data(contentsOf: authURL),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+    private func readAuthMetadata(name: String, authURL: URL, capturedAt: String, alias: String, desktopState: String) -> AuthMetadata {
+        guard let data = try? Data(contentsOf: authURL), !data.isEmpty else {
             return AuthMetadata(
                 profileName: name,
+                alias: alias,
                 authURL: authURL,
                 exists: false,
                 authMode: "-",
                 accountID: "-",
                 email: "-",
+                planType: "-",
+                workspaceID: "-",
+                workspaceLabel: "-",
+                seatType: "-",
                 lastRefresh: "-",
                 capturedAt: capturedAt,
+                desktopState: desktopState,
                 hasAPIKey: false,
-                tokens: [:]
+                tokens: [:],
+                tokenStatuses: [:],
+                health: ProfileHealth(level: .error, title: "Missing auth", detail: "auth.json is missing or empty.", systemImage: "xmark.octagon.fill")
+            )
+        }
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return AuthMetadata(
+                profileName: name,
+                alias: alias,
+                authURL: authURL,
+                exists: true,
+                authMode: "-",
+                accountID: "-",
+                email: "-",
+                planType: "-",
+                workspaceID: "-",
+                workspaceLabel: "-",
+                seatType: "-",
+                lastRefresh: "-",
+                capturedAt: capturedAt,
+                desktopState: desktopState,
+                hasAPIKey: false,
+                tokens: [:],
+                tokenStatuses: [:],
+                health: ProfileHealth(level: .error, title: "Invalid auth", detail: "auth.json could not be parsed.", systemImage: "exclamationmark.triangle.fill")
             )
         }
 
         let tokenMap = raw["tokens"] as? [String: Any] ?? [:]
         var tokens: [String: String] = [:]
-        for key in ["access_token", "refresh_token", "id_token"] {
-            if let value = tokenMap[key] as? String, !value.isEmpty {
-                tokens[key] = value
-            }
+        let tokenAliases: [(String, [Any?])] = [
+            ("access_token", [tokenMap["access_token"], tokenMap["accessToken"]]),
+            ("refresh_token", [tokenMap["refresh_token"], tokenMap["refreshToken"]]),
+            ("id_token", [tokenMap["id_token"], tokenMap["idToken"]])
+        ]
+        for (key, values) in tokenAliases {
+            let value = firstString(values)
+            if !value.isEmpty { tokens[key] = value }
         }
 
         let idTokenClaims = decodeJWTClaims(tokens["id_token"])
         let accessClaims = decodeJWTClaims(tokens["access_token"])
+        let authClaims = firstDictionary([
+            idTokenClaims["https://api.openai.com/auth"],
+            accessClaims["https://api.openai.com/auth"]
+        ])
         let email = firstString([
             idTokenClaims["email"],
             accessClaims["email"],
@@ -407,22 +544,65 @@ final class AccountStore: ObservableObject {
         ])
         let accountID = firstString([
             tokenMap["account_id"],
+            tokenMap["accountId"],
             idTokenClaims["https://api.openai.com/auth"],
+            idTokenClaims["chatgpt_account_id"],
             idTokenClaims["sub"],
             accessClaims["sub"]
         ])
+        let planType = firstString([
+            authClaims["chatgpt_plan_type"],
+            idTokenClaims["chatgpt_plan_type"],
+            accessClaims["chatgpt_plan_type"]
+        ])
+        let workspaceID = firstString([
+            authClaims["workspace_id"],
+            authClaims["chatgpt_workspace_id"],
+            authClaims["organization_id"],
+            idTokenClaims["workspace_id"],
+            idTokenClaims["organization_id"]
+        ])
+        let workspaceLabel = firstString([
+            authClaims["workspace_label"],
+            authClaims["workspace_name"],
+            authClaims["organization_name"],
+            idTokenClaims["workspace_label"],
+            idTokenClaims["organization_name"]
+        ])
+        let seatType = firstString([
+            authClaims["seat_type"],
+            authClaims["chatgpt_seat_type"],
+            idTokenClaims["seat_type"]
+        ])
+        let statuses = buildTokenStatuses(tokens: tokens)
+        let hasAPIKey = (raw["OPENAI_API_KEY"] as? String)?.isEmpty == false
+        let health = profileHealth(
+            exists: true,
+            hasAPIKey: hasAPIKey,
+            tokens: tokens,
+            tokenStatuses: statuses,
+            desktopState: desktopState
+        )
 
         return AuthMetadata(
             profileName: name,
+            alias: alias,
             authURL: authURL,
             exists: true,
             authMode: stringValue(raw["auth_mode"], fallback: "-"),
             accountID: accountID.isEmpty ? "-" : accountID,
             email: email.isEmpty ? "-" : email,
-            lastRefresh: stringValue(raw["last_refresh"], fallback: "-"),
+            planType: planType.isEmpty ? "-" : normalizeSlug(planType),
+            workspaceID: workspaceID.isEmpty ? "-" : workspaceID,
+            workspaceLabel: workspaceLabel.isEmpty ? "-" : workspaceLabel,
+            seatType: seatType.isEmpty ? "-" : normalizeSlug(seatType),
+            lastRefresh: firstString([raw["last_refresh"], raw["lastRefreshAt"], raw["lastRefresh"]]).isEmpty ? "-" : firstString([raw["last_refresh"], raw["lastRefreshAt"], raw["lastRefresh"]]),
             capturedAt: capturedAt,
-            hasAPIKey: (raw["OPENAI_API_KEY"] as? String)?.isEmpty == false,
-            tokens: tokens
+            desktopState: desktopState,
+            hasAPIKey: hasAPIKey,
+            tokens: tokens,
+            tokenStatuses: statuses,
+            health: health
         )
     }
 
@@ -449,6 +629,9 @@ final class AccountStore: ObservableObject {
                 return string
             }
             if let dict = value as? [String: Any] {
+                if let accountID = dict["chatgpt_account_id"] as? String, !accountID.isEmpty {
+                    return accountID
+                }
                 if let accountID = dict["account_id"] as? String, !accountID.isEmpty {
                     return accountID
                 }
@@ -458,6 +641,110 @@ final class AccountStore: ObservableObject {
             }
         }
         return ""
+    }
+
+    private func firstDictionary(_ values: [Any?]) -> [String: Any] {
+        for value in values {
+            if let dict = value as? [String: Any] {
+                return dict
+            }
+        }
+        return [:]
+    }
+
+    private func buildTokenStatuses(tokens: [String: String]) -> [String: TokenStatus] {
+        var statuses: [String: TokenStatus] = [:]
+        statuses["access_token"] = expiringTokenStatus(
+            key: "access_token",
+            label: "Access",
+            token: tokens["access_token"]
+        )
+        statuses["id_token"] = expiringTokenStatus(
+            key: "id_token",
+            label: "ID token",
+            token: tokens["id_token"]
+        )
+        if tokens["refresh_token"]?.isEmpty == false {
+            statuses["refresh_token"] = TokenStatus(
+                key: "refresh_token",
+                label: "Refresh",
+                state: "Stored",
+                detail: "Available for token refresh."
+            )
+        } else {
+            statuses["refresh_token"] = TokenStatus(
+                key: "refresh_token",
+                label: "Refresh",
+                state: "Missing",
+                detail: "Re-authentication is likely required."
+            )
+        }
+        return statuses
+    }
+
+    private func expiringTokenStatus(key: String, label: String, token: String?) -> TokenStatus {
+        guard let token, !token.isEmpty else {
+            return TokenStatus(key: key, label: label, state: "Missing", detail: "Token is not present.")
+        }
+        guard let expiry = tokenExpiryDate(token) else {
+            return TokenStatus(key: key, label: label, state: "Unknown", detail: "No expiry claim found.")
+        }
+        if expiry <= Date() {
+            return TokenStatus(key: key, label: label, state: "Expired", detail: formatRelativeExpiry(expiry))
+        }
+        return TokenStatus(key: key, label: label, state: "Valid", detail: formatRelativeExpiry(expiry))
+    }
+
+    private func tokenExpiryDate(_ token: String) -> Date? {
+        let claims = decodeJWTClaims(token)
+        guard let raw = claims["exp"] else { return nil }
+        if let value = raw as? Int {
+            return Date(timeIntervalSince1970: TimeInterval(value))
+        }
+        if let value = raw as? TimeInterval {
+            return Date(timeIntervalSince1970: value)
+        }
+        if let value = raw as? NSNumber {
+            return Date(timeIntervalSince1970: value.doubleValue)
+        }
+        if let value = raw as? String, let seconds = TimeInterval(value) {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        return nil
+    }
+
+    private func formatRelativeExpiry(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func profileHealth(
+        exists: Bool,
+        hasAPIKey: Bool,
+        tokens: [String: String],
+        tokenStatuses: [String: TokenStatus],
+        desktopState: String
+    ) -> ProfileHealth {
+        guard exists else {
+            return ProfileHealth(level: .error, title: "Missing auth", detail: "auth.json is missing.", systemImage: "xmark.octagon.fill")
+        }
+        if hasAPIKey {
+            return ProfileHealth(level: .healthy, title: "API key auth", detail: "OPENAI_API_KEY is present.", systemImage: "terminal.fill")
+        }
+        if tokens.isEmpty {
+            return ProfileHealth(level: .error, title: "No tokens", detail: "No usable token entries were found.", systemImage: "key.slash.fill")
+        }
+        if tokenStatuses["refresh_token"]?.state == "Missing" {
+            return ProfileHealth(level: .error, title: "Reauth needed", detail: "Refresh token is missing.", systemImage: "person.badge.key.fill")
+        }
+        if tokenStatuses["access_token"]?.state == "Expired" {
+            return ProfileHealth(level: .warning, title: "Refresh soon", detail: "Access token is expired; refresh token is stored.", systemImage: "clock.badge.exclamationmark.fill")
+        }
+        if desktopState == "Missing" {
+            return ProfileHealth(level: .warning, title: "Auth only", detail: "Codex Desktop state was not captured.", systemImage: "macwindow.badge.exclamationmark")
+        }
+        return ProfileHealth(level: .healthy, title: "Ready", detail: "Auth and Desktop state look usable.", systemImage: "checkmark.seal.fill")
     }
 
     private func stringValue(_ value: Any?, fallback: String) -> String {
@@ -474,6 +761,52 @@ final class AccountStore: ObservableObject {
             .appendingPathComponent(name)
             .appendingPathComponent("auth")
             .appendingPathComponent("auth.json")
+    }
+
+    private func profileEnvURL(_ name: String) -> URL {
+        switcherHome
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(name)
+            .appendingPathComponent("profile.env")
+    }
+
+    private func profileEnvValue(_ name: String, key: String, fallback: String = "-") -> String {
+        let envURL = profileEnvURL(name)
+        guard let text = try? String(contentsOf: envURL, encoding: .utf8) else {
+            return fallback
+        }
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("\(key)=") {
+                return String(line.dropFirst(key.count + 1))
+            }
+        }
+        return fallback
+    }
+
+    private func writeProfileEnvValue(profile name: String, key: String, value: String?) throws {
+        let envURL = profileEnvURL(name)
+        var lines: [String] = []
+        if let text = try? String(contentsOf: envURL, encoding: .utf8) {
+            lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+                .filter { !$0.hasPrefix("\(key)=") }
+        } else {
+            lines = ["name=\(name)"]
+        }
+        if let value, !value.isEmpty {
+            lines.append("\(key)=\(value)")
+        }
+        let text = lines.joined(separator: "\n") + "\n"
+        try text.write(to: envURL, atomically: true, encoding: .utf8)
+    }
+
+    private func profileDesktopState(_ name: String) -> String {
+        let url = switcherHome
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(name)
+            .appendingPathComponent("app-support")
+            .appendingPathComponent("Codex")
+        return FileManager.default.fileExists(atPath: url.path) ? "Captured" : "Missing"
     }
 
     private func profileCapturedAt(_ name: String) -> String {
@@ -493,16 +826,26 @@ final class AccountStore: ObservableObject {
     }
 
     private func authSummary(for url: URL) -> String {
-        let metadata = readAuthMetadata(name: "Current Codex", authURL: url, capturedAt: "-")
+        let metadata = readAuthMetadata(name: "Current Codex", authURL: url, capturedAt: "-", alias: "", desktopState: "-")
         if metadata.email != "-" {
             return metadata.email
         }
         return shortAccount(metadata.accountID)
     }
 
+    private func profileContextLine(_ metadata: AuthMetadata) -> String {
+        let plan = metadata.planType == "-" ? "unknown plan" : metadata.planType
+        let workspace = metadata.workspaceLabel != "-" ? metadata.workspaceLabel : (metadata.workspaceID != "-" ? shortAccount(metadata.workspaceID) : "Personal / unknown workspace")
+        return "\(plan) | \(workspace)"
+    }
+
     private func shortAccount(_ value: String) -> String {
         guard value != "-", value.count > 12 else { return value }
         return "\(value.prefix(8))...\(value.suffix(4))"
+    }
+
+    private func normalizeSlug(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")
     }
 
     private func isValidProfileName(_ value: String) -> Bool {
@@ -547,7 +890,8 @@ struct ManagerView: View {
                     ForEach(store.rows) { row in
                         ProfileCardButton(
                             row: row,
-                            isSelected: store.selectedID == row.id
+                            isSelected: store.selectedID == row.id,
+                            privacyMode: store.privacyMode
                         ) {
                             store.selectedID = row.id
                         }
@@ -622,6 +966,13 @@ struct ManagerView: View {
                 Label("Profiles Folder", systemImage: "folder")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            Button {
+                store.togglePrivacyMode()
+            } label: {
+                Label(store.privacyMode ? "Show Details" : "Hide Details", systemImage: store.privacyMode ? "eye.slash" : "eye")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .buttonStyle(.bordered)
     }
@@ -631,6 +982,7 @@ struct ManagerView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerPanel
                 actionPanel
+                tokenStatusPanel
                 metadataPanel
                 tokenVault
             }
@@ -651,9 +1003,7 @@ struct ManagerView: View {
 
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 8) {
-                        Text(store.selectedMetadata.profileName)
-                            .font(.system(size: 28, weight: .semibold))
-                            .lineLimit(1)
+                        aliasHeader
                         if store.selectedID == store.activeProfile {
                             StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
                         }
@@ -681,6 +1031,7 @@ struct ManagerView: View {
             }
 
             HStack(spacing: 10) {
+                SummaryTile(title: "Health", value: store.selectedMetadata.health.title, systemImage: store.selectedMetadata.health.systemImage, color: healthColor(store.selectedMetadata.health))
                 SummaryTile(title: "Auth file", value: store.selectedMetadata.exists ? "Found" : "Missing", systemImage: "doc.text.magnifyingglass", color: store.selectedMetadata.exists ? .green : .red)
                 SummaryTile(title: "Tokens", value: "\(store.selectedMetadata.tokens.count)", systemImage: "key.horizontal.fill", color: .orange)
                 SummaryTile(title: "API key", value: store.selectedMetadata.hasAPIKey ? "Present" : "None", systemImage: "terminal.fill", color: store.selectedMetadata.hasAPIKey ? .purple : .secondary)
@@ -689,6 +1040,46 @@ struct ManagerView: View {
         .padding(18)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var aliasHeader: some View {
+        HStack(spacing: 6) {
+            if store.isEditingAlias {
+                TextField("Profile alias", text: $store.aliasDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 250)
+                    .onSubmit {
+                        store.saveAlias()
+                    }
+                Button {
+                    store.saveAlias()
+                } label: {
+                    Image(systemName: "checkmark")
+                }
+                .buttonStyle(.borderless)
+                .disabled(store.isWorking)
+                Button {
+                    store.cancelAliasEdit()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+            } else {
+                Text(store.selectedMetadata.displayName)
+                    .font(.system(size: 28, weight: .semibold))
+                    .lineLimit(1)
+                if store.selectedID != currentSelection {
+                    Button {
+                        store.aliasDraft = store.selectedMetadata.alias
+                        store.isEditingAlias = true
+                    } label: {
+                        Image(systemName: "pencil")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Edit local alias")
+                }
+            }
+        }
     }
 
     private var actionPanel: some View {
@@ -755,11 +1146,26 @@ struct ManagerView: View {
         SectionPanel(title: "Profile Details", systemImage: "list.bullet.rectangle") {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 12) {
                 metadataRow("Auth mode", store.selectedMetadata.authMode)
-                metadataRow("Email", store.selectedMetadata.email)
-                metadataRow("Account ID", store.selectedMetadata.accountID)
+                metadataRow("Email", store.displaySensitive(store.selectedMetadata.email))
+                metadataRow("Account ID", store.displaySensitive(store.selectedMetadata.accountID))
+                metadataRow("Plan", store.selectedMetadata.planType)
+                metadataRow("Workspace", workspaceDisplay)
+                metadataRow("Seat", store.selectedMetadata.seatType)
                 metadataRow("Last refresh", store.selectedMetadata.lastRefresh)
                 metadataRow("Captured at", store.selectedMetadata.capturedAt)
+                metadataRow("Desktop state", store.selectedMetadata.desktopState)
                 metadataRow("Auth path", store.selectedMetadata.authURL.path)
+            }
+        }
+    }
+
+    private var tokenStatusPanel: some View {
+        SectionPanel(title: "Token Status", systemImage: "key.radiowaves.forward.fill") {
+            VStack(spacing: 8) {
+                ForEach(["access_token", "refresh_token", "id_token"], id: \.self) { key in
+                    let status = store.selectedMetadata.tokenStatuses[key] ?? TokenStatus(key: key, label: store.friendlyTokenName(key), state: "Missing", detail: "Token is not present.")
+                    TokenStatusRow(status: status, color: tokenStatusColor(status))
+                }
             }
         }
     }
@@ -830,13 +1236,27 @@ struct ManagerView: View {
     }
 
     private var selectedSubtitle: String {
+        if store.selectedMetadata.alias.isEmpty == false, store.selectedMetadata.profileName != "Current Codex" {
+            let email = store.selectedMetadata.email != "-" ? store.displaySensitive(store.selectedMetadata.email) : store.selectedMetadata.profileName
+            return "\(email) | \(workspaceDisplay)"
+        }
         if store.selectedMetadata.email != "-" {
-            return store.selectedMetadata.email
+            return store.displaySensitive(store.selectedMetadata.email)
         }
         if store.selectedMetadata.accountID != "-" {
-            return store.selectedMetadata.accountID
+            return store.displaySensitive(store.selectedMetadata.accountID)
         }
         return store.selectedMetadata.authURL.path
+    }
+
+    private var workspaceDisplay: String {
+        if store.selectedMetadata.workspaceLabel != "-" {
+            return store.selectedMetadata.workspaceLabel
+        }
+        if store.selectedMetadata.workspaceID != "-" {
+            return store.displaySensitive(store.selectedMetadata.workspaceID)
+        }
+        return "Personal / unknown workspace"
     }
 
     private var selectedIcon: String {
@@ -862,6 +1282,24 @@ struct ManagerView: View {
         messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill"
     }
 
+    private func healthColor(_ health: ProfileHealth) -> Color {
+        switch health.level {
+        case .healthy: return .green
+        case .warning: return .orange
+        case .error: return .red
+        case .unknown: return .secondary
+        }
+    }
+
+    private func tokenStatusColor(_ status: TokenStatus) -> Color {
+        switch status.state.lowercased() {
+        case "valid", "stored", "parsed": return .green
+        case "expired", "missing": return .red
+        case "unknown": return .orange
+        default: return .secondary
+        }
+    }
+
     private func confirmDelete() {
         let alert = NSAlert()
         alert.messageText = "Delete profile \(store.selectedID)?"
@@ -878,38 +1316,49 @@ struct ManagerView: View {
 private struct ProfileCardButton: View {
     let row: ProfileRow
     let isSelected: Bool
+    let privacyMode: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
                 Image(systemName: row.isCurrentAuth ? "bolt.circle.fill" : "person.crop.circle")
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(iconColor)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 34, height: 34)
                     .background(iconColor.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
 
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(row.name)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        if row.isActive {
-                            StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
-                        }
-                    }
-                    Text(row.subtitle)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(row.displayName)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(masked(row.subtitle))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    Text(masked(row.meta))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                .layoutPriority(1)
 
-                Spacer(minLength: 0)
+                Spacer(minLength: 4)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    if row.isActive {
+                        StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
+                    }
+                    HealthBadge(health: row.health)
+                }
+                .frame(minWidth: 74, alignment: .trailing)
             }
-            .padding(10)
+            .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(cardBackground)
             .overlay(
@@ -919,6 +1368,17 @@ private struct ProfileCardButton: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+    }
+
+    private func masked(_ value: String) -> String {
+        guard privacyMode else { return value }
+        if let range = value.range(of: #"[\w.+-]+@[\w.-]+"#, options: .regularExpression) {
+            let email = String(value[range])
+            let parts = email.split(separator: "@", maxSplits: 1).map(String.init)
+            let maskedEmail = "\(String((parts.first ?? "").prefix(2)))***@\(parts.count > 1 ? parts[1] : "")"
+            return value.replacingCharacters(in: range, with: maskedEmail)
+        }
+        return value
     }
 
     private var iconColor: Color {
@@ -940,6 +1400,8 @@ private struct StatusPill: View {
             .font(.system(size: 10, weight: .bold))
             .labelStyle(.titleAndIcon)
             .foregroundStyle(color)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(color.opacity(0.13))
@@ -972,6 +1434,75 @@ private struct SummaryTile: View {
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.58))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct HealthBadge: View {
+    let health: ProfileHealth
+
+    var body: some View {
+        Label(health.title, systemImage: health.systemImage)
+            .font(.system(size: 10, weight: .semibold))
+            .labelStyle(.titleAndIcon)
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .frame(maxWidth: 90, alignment: .trailing)
+            .background(color.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .help(health.detail)
+    }
+
+    private var color: Color {
+        switch health.level {
+        case .healthy: return .green
+        case .warning: return .orange
+        case .error: return .red
+        case .unknown: return .secondary
+        }
+    }
+}
+
+private struct TokenStatusRow: View {
+    let status: TokenStatus
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(status.label)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(status.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Text(status.state)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(color)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(color.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+        }
+        .padding(10)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.58))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var icon: String {
+        switch status.state.lowercased() {
+        case "valid", "stored", "parsed": return "checkmark.circle.fill"
+        case "expired", "missing": return "exclamationmark.triangle.fill"
+        default: return "questionmark.circle.fill"
+        }
     }
 }
 
@@ -1114,7 +1645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         for row in store.rows where !row.isCurrentAuth {
-            let title = row.isActive ? "\(row.name)  (active)" : row.name
+            let title = row.isActive ? "\(row.displayName)  (active)" : row.displayName
             let item = NSMenuItem(title: title, action: #selector(menuSwitchProfile(_:)), keyEquivalent: "")
             item.representedObject = row.id
             item.target = self
