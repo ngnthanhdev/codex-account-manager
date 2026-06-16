@@ -5,6 +5,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 private let currentSelection = "__current_codex_auth__"
+private let usageSnapshotsDefaultsKey = "CodexAccountSwitcherUsageSnapshotsByProfile.v2"
+private let usageValidSinceDefaultsKey = "CodexAccountSwitcherUsageValidSinceByProfile.v2"
 
 private func debugLog(_ message: String) {
     let url = FileManager.default.homeDirectoryForCurrentUser
@@ -48,6 +50,47 @@ struct TokenStatus {
     let label: String
     let state: String
     let detail: String
+}
+
+struct UsageLimitWindow: Codable {
+    let usedPercent: Double
+    let windowMinutes: Int
+    let resetAt: Date?
+
+    var leftPercent: Double {
+        max(0, min(100, 100 - usedPercent))
+    }
+}
+
+struct CodexUsageSnapshot: Codable {
+    let contextUsed: Int
+    let contextWindow: Int
+    let model: String
+    let updatedAt: Date?
+    let observedAt: Date?
+    let primaryLimit: UsageLimitWindow?
+    let secondaryLimit: UsageLimitWindow?
+
+    static let empty = CodexUsageSnapshot(
+        contextUsed: 0,
+        contextWindow: 272000,
+        model: "-",
+        updatedAt: nil,
+        observedAt: nil,
+        primaryLimit: nil,
+        secondaryLimit: nil
+    )
+
+    var contextLeftPercent: Double {
+        guard contextWindow > 0 else { return 0 }
+        return max(0, min(100, 100 - (Double(contextUsed) / Double(contextWindow) * 100)))
+    }
+}
+
+private struct RateLimitSnapshot {
+    let primary: UsageLimitWindow?
+    let secondary: UsageLimitWindow?
+    let observedAt: Date
 }
 
 struct AuthMetadata {
@@ -105,9 +148,13 @@ final class AccountStore: ObservableObject {
     @Published var isEditingProfileName: Bool = false
     @Published var isWorking: Bool = false
     @Published var message: String = "Ready"
+    @Published var usageSnapshot: CodexUsageSnapshot = .empty
+    @Published var usageSnapshotsByProfile: [String: CodexUsageSnapshot] = [:]
+    private var usageValidSinceByProfile: [String: Date] = [:]
 
     let switcherHome: URL
     private let scriptPath: String
+    private let codexHome: URL
     private var autoSaveTimer: Timer?
     private var isAutoSaving = false
     private var lastAutoSaveFingerprint = ""
@@ -118,6 +165,7 @@ final class AccountStore: ObservableObject {
             .appendingPathComponent("Library")
             .appendingPathComponent("Application Support")
             .appendingPathComponent("CodexAccountSwitcher")
+        codexHome = home.appendingPathComponent(".codex")
 
         if let bundled = Bundle.main.path(forResource: "codex-account-switcher", ofType: "sh") {
             scriptPath = bundled
@@ -125,6 +173,8 @@ final class AccountStore: ObservableObject {
             scriptPath = FileManager.default.currentDirectoryPath + "/codex-account-switcher.sh"
         }
         privacyMode = UserDefaults.standard.bool(forKey: "CodexAccountSwitcherPrivacyMode")
+        usageSnapshotsByProfile = loadUsageSnapshotsByProfile()
+        usageValidSinceByProfile = loadUsageValidSinceByProfile()
 
         reload()
         startAutoSaveTimer()
@@ -163,7 +213,7 @@ final class AccountStore: ObservableObject {
             .appendingPathComponent("auth.json")
     }
 
-    func reload() {
+    func reload(refreshUsage: Bool = true) {
         activeProfile = run(["active"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
         let profileNames = run(["list", "--plain"]).output
             .split(separator: "\n")
@@ -206,6 +256,68 @@ final class AccountStore: ObservableObject {
             selectedID = rows.first?.id ?? currentSelection
         }
         loadSelected()
+        if refreshUsage {
+            refreshUsageSnapshotAsync()
+        }
+    }
+
+    func refreshUsageSnapshotAsync() {
+        let profileID = activeProfile.isEmpty ? currentSelection : activeProfile
+        let minDate = usageValidSinceByProfile[profileID]
+        DispatchQueue.global(qos: .utility).async {
+            let snapshot = self.readUsageSnapshot(minRateLimitDate: minDate)
+            DispatchQueue.main.async {
+                guard let snapshot else { return }
+                self.usageSnapshot = snapshot
+                self.usageSnapshotsByProfile[profileID] = snapshot
+                self.saveUsageSnapshotsByProfile()
+            }
+        }
+    }
+
+    func cacheUsageSnapshotForActiveProfile() {
+        let profileID = activeProfile.isEmpty ? currentSelection : activeProfile
+        let snapshot = readUsageSnapshot(minRateLimitDate: usageValidSinceByProfile[profileID])
+        guard let snapshot else { return }
+        usageSnapshot = snapshot
+        usageSnapshotsByProfile[profileID] = snapshot
+        saveUsageSnapshotsByProfile()
+    }
+
+    func markUsageValidFromNow(for profileID: String) {
+        usageValidSinceByProfile[profileID] = Date()
+        saveUsageValidSinceByProfile()
+        usageSnapshot = usageSnapshot(for: profileID)
+    }
+
+    func usageSnapshot(for profileID: String) -> CodexUsageSnapshot {
+        usageSnapshotsByProfile[profileID] ?? .empty
+    }
+
+    private func loadUsageSnapshotsByProfile() -> [String: CodexUsageSnapshot] {
+        guard let data = UserDefaults.standard.data(forKey: usageSnapshotsDefaultsKey),
+              let snapshots = try? JSONDecoder().decode([String: CodexUsageSnapshot].self, from: data) else {
+            return [:]
+        }
+        return snapshots
+    }
+
+    private func saveUsageSnapshotsByProfile() {
+        guard let data = try? JSONEncoder().encode(usageSnapshotsByProfile) else { return }
+        UserDefaults.standard.set(data, forKey: usageSnapshotsDefaultsKey)
+    }
+
+    private func loadUsageValidSinceByProfile() -> [String: Date] {
+        guard let data = UserDefaults.standard.data(forKey: usageValidSinceDefaultsKey),
+              let values = try? JSONDecoder().decode([String: Date].self, from: data) else {
+            return [:]
+        }
+        return values
+    }
+
+    private func saveUsageValidSinceByProfile() {
+        guard let data = try? JSONEncoder().encode(usageValidSinceByProfile) else { return }
+        UserDefaults.standard.set(data, forKey: usageValidSinceDefaultsKey)
     }
 
     func loadSelected() {
@@ -320,7 +432,11 @@ final class AccountStore: ObservableObject {
             message = "\(selectedID) is already the active profile."
             return
         }
-        perform(["switch", selectedID], successMessage: "Switched to \(selectedID)")
+        cacheUsageSnapshotForActiveProfile()
+        let targetProfile = selectedID
+        perform(["switch", targetProfile], successMessage: "Switched to \(targetProfile)", refreshUsage: false) {
+            self.markUsageValidFromNow(for: targetProfile)
+        }
     }
 
     func saveActiveProfile() {
@@ -444,7 +560,7 @@ final class AccountStore: ObservableObject {
         }
     }
 
-    private func perform(_ args: [String], successMessage: String, afterSuccess: (() -> Void)? = nil) {
+    private func perform(_ args: [String], successMessage: String, refreshUsage: Bool = true, afterSuccess: (() -> Void)? = nil) {
         isWorking = true
         message = "Working..."
         DispatchQueue.global(qos: .userInitiated).async {
@@ -454,7 +570,7 @@ final class AccountStore: ObservableObject {
                 if result.status == 0 {
                     afterSuccess?()
                     self.message = successMessage
-                    self.reload()
+                    self.reload(refreshUsage: refreshUsage)
                 } else {
                     self.message = result.output.isEmpty ? "Command failed." : result.output
                 }
@@ -466,8 +582,10 @@ final class AccountStore: ObservableObject {
         autoSaveTimer?.invalidate()
         autoSaveTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             self?.autoSaveActiveAuthIfNeeded()
+            self?.refreshUsageSnapshotAsync()
         }
         autoSaveActiveAuthIfNeeded()
+        refreshUsageSnapshotAsync()
     }
 
     private func autoSaveActiveAuthIfNeeded() {
@@ -537,6 +655,131 @@ final class AccountStore: ObservableObject {
         } catch {
             return CommandResult(status: 127, output: error.localizedDescription)
         }
+    }
+
+    private func runExecutable(_ executable: String, _ arguments: [String]) -> CommandResult {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return CommandResult(status: task.terminationStatus, output: output)
+        } catch {
+            return CommandResult(status: 127, output: error.localizedDescription)
+        }
+    }
+
+    private func readUsageSnapshot(minRateLimitDate: Date?) -> CodexUsageSnapshot? {
+        let stateDB = codexHome.appendingPathComponent("state_5.sqlite")
+        guard FileManager.default.fileExists(atPath: stateDB.path) else {
+            return nil
+        }
+
+        let query = "select coalesce(tokens_used,0), coalesce(model,''), coalesce(updated_at_ms, updated_at * 1000) from threads where tokens_used > 0 order by updated_at desc limit 1;"
+        let result = runExecutable("/usr/bin/sqlite3", ["-separator", "\t", stateDB.path, query])
+        guard result.status == 0 else {
+            debugLog("usage snapshot sqlite failed: \(result.output)")
+            return nil
+        }
+
+        let parts = result.output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\t", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard parts.count >= 3 else {
+            return nil
+        }
+
+        let used = Int(parts[0]) ?? 0
+        let model = parts[1].isEmpty ? "-" : parts[1]
+        let updatedMillis = TimeInterval(parts[2]) ?? 0
+        let contextWindow = contextWindowForModel(model)
+        guard let limits = readRateLimits(minDate: minRateLimitDate) else {
+            return nil
+        }
+
+        return CodexUsageSnapshot(
+            contextUsed: used,
+            contextWindow: contextWindow,
+            model: model,
+            updatedAt: updatedMillis > 0 ? Date(timeIntervalSince1970: updatedMillis / 1000) : nil,
+            observedAt: limits.observedAt,
+            primaryLimit: limits.primary,
+            secondaryLimit: limits.secondary
+        )
+    }
+
+    private func contextWindowForModel(_ model: String) -> Int {
+        let windows = [
+            "gpt-5.5": 272000,
+            "gpt-5.2": 272000,
+            "gpt-5.1": 272000,
+            "gpt-5": 272000
+        ]
+        return windows[model] ?? 272000
+    }
+
+    private func readRateLimits(minDate: Date?) -> RateLimitSnapshot? {
+        let logsDB = codexHome.appendingPathComponent("logs_2.sqlite")
+        guard FileManager.default.fileExists(atPath: logsDB.path) else {
+            return nil
+        }
+
+        let minSeconds = minDate.map { Int($0.timeIntervalSince1970) } ?? 0
+        let query = "select ts, feedback_log_body from logs where ts >= \(minSeconds) and feedback_log_body like '%\"type\":\"codex.rate_limits\"%' order by ts desc, ts_nanos desc, id desc limit 1;"
+        let result = runExecutable("/usr/bin/sqlite3", ["-separator", "\t", logsDB.path, query])
+        guard result.status == 0 else {
+            debugLog("rate limit sqlite failed: \(result.output)")
+            return nil
+        }
+
+        let parts = result.output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            .map(String.init)
+        guard parts.count == 2,
+              let observedSeconds = TimeInterval(parts[0]),
+              let range = parts[1].range(of: #"{"type":"codex.rate_limits""#),
+              let data = String(parts[1][range.lowerBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rateLimits = raw["rate_limits"] as? [String: Any] else {
+            return nil
+        }
+
+        return RateLimitSnapshot(
+            primary: parseUsageLimit(rateLimits["primary"]),
+            secondary: parseUsageLimit(rateLimits["secondary"]),
+            observedAt: Date(timeIntervalSince1970: observedSeconds)
+        )
+    }
+
+    private func parseUsageLimit(_ value: Any?) -> UsageLimitWindow? {
+        guard let raw = value as? [String: Any],
+              let usedPercent = doubleValue(raw["used_percent"]),
+              let windowMinutes = intValue(raw["window_minutes"]) else {
+            return nil
+        }
+        let resetAt: Date?
+        if let seconds = doubleValue(raw["reset_at"]) {
+            resetAt = Date(timeIntervalSince1970: seconds)
+        } else {
+            resetAt = nil
+        }
+        return UsageLimitWindow(
+            usedPercent: usedPercent,
+            windowMinutes: windowMinutes,
+            resetAt: resetAt
+        )
     }
 
     private func metadataForCurrentAuth() -> AuthMetadata {
@@ -841,6 +1084,35 @@ final class AccountStore: ObservableObject {
         return "\(value)"
     }
 
+    private func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let double = value as? Double {
+            return double
+        }
+        if let int = value as? Int {
+            return Double(int)
+        }
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
     private func profileAuthURL(_ name: String) -> URL {
         switcherHome
             .appendingPathComponent("profiles")
@@ -941,6 +1213,7 @@ final class AccountStore: ObservableObject {
 
 struct ManagerView: View {
     @ObservedObject var store: AccountStore
+    @State private var hoveredProfileID: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -980,6 +1253,8 @@ struct ManagerView: View {
                             privacyMode: store.privacyMode
                         ) {
                             store.selectedID = row.id
+                        } onHover: { isHovering in
+                            hoveredProfileID = isHovering ? row.id : nil
                         }
                     }
                 }
@@ -1077,6 +1352,7 @@ struct ManagerView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerPanel
                 actionPanel
+                usagePanel
                 tokenStatusPanel
                 importExportPanel
                 metadataPanel
@@ -1282,6 +1558,41 @@ struct ManagerView: View {
         .padding(16)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var usagePanel: some View {
+        let snapshot = store.usageSnapshot(for: usageProfileID)
+        return SectionPanel(title: "Codex Usage", systemImage: "chart.bar.xaxis") {
+            VStack(spacing: 12) {
+                UsageMeterRow(
+                    title: "Context",
+                    leftPercent: snapshot.contextLeftPercent,
+                    detail: "\(formatNumber(snapshot.contextUsed)) used / \(compactNumber(snapshot.contextWindow))",
+                    resetText: snapshot.model == "-" ? "No thread data" : snapshot.model,
+                    color: .blue
+                )
+
+                UsageMeterRow(
+                    title: "5h limit",
+                    leftPercent: snapshot.primaryLimit?.leftPercent,
+                    detail: nil,
+                    resetText: resetText(for: snapshot.primaryLimit),
+                    color: .green
+                )
+
+                UsageMeterRow(
+                    title: "7d limit",
+                    leftPercent: snapshot.secondaryLimit?.leftPercent,
+                    detail: nil,
+                    resetText: resetText(for: snapshot.secondaryLimit),
+                    color: .orange
+                )
+            }
+        }
+    }
+
+    private var usageProfileID: String {
+        hoveredProfileID ?? store.selectedID
     }
 
     private var metadataPanel: some View {
@@ -1503,6 +1814,27 @@ struct ManagerView: View {
             store.deleteSelected()
         }
     }
+
+    private func resetText(for limit: UsageLimitWindow?) -> String {
+        guard let limit else { return "No recent data" }
+        guard let resetAt = limit.resetAt else { return "Reset unknown" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "resets \(formatter.localizedString(for: resetAt, relativeTo: Date()))"
+    }
+
+    private func formatNumber(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private func compactNumber(_ value: Int) -> String {
+        if value >= 1000 {
+            return "\(value / 1000)K"
+        }
+        return "\(value)"
+    }
 }
 
 private struct ProfileCardButton: View {
@@ -1510,6 +1842,7 @@ private struct ProfileCardButton: View {
     let isSelected: Bool
     let privacyMode: Bool
     let action: () -> Void
+    let onHover: (Bool) -> Void
 
     var body: some View {
         Button(action: action) {
@@ -1548,7 +1881,7 @@ private struct ProfileCardButton: View {
                     }
                     HealthBadge(health: row.health)
                 }
-                .frame(minWidth: 74, alignment: .trailing)
+                .frame(width: 92, alignment: .trailing)
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1560,6 +1893,7 @@ private struct ProfileCardButton: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .onHover(perform: onHover)
     }
 
     private func masked(_ value: String) -> String {
@@ -1593,7 +1927,7 @@ private struct StatusPill: View {
             .labelStyle(.titleAndIcon)
             .foregroundStyle(color)
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(width: 82, alignment: .center)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(color.opacity(0.13))
@@ -1629,6 +1963,69 @@ private struct SummaryTile: View {
     }
 }
 
+private struct UsageMeterRow: View {
+    let title: String
+    let leftPercent: Double?
+    let detail: String?
+    let resetText: String
+    let color: Color
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 0) {
+            GridRow {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 82, alignment: .leading)
+
+                meterBar
+                    .frame(minWidth: 240, maxWidth: .infinity)
+
+                HStack(spacing: 5) {
+                    Text(leftText)
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(leftPercent == nil ? .secondary : .primary)
+                    if let detail {
+                        Text("(\(detail))")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text(resetText)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(width: 250, alignment: .leading)
+            }
+        }
+    }
+
+    private var meterBar: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let progress = max(0, min(1, (leftPercent ?? 0) / 100))
+
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color(nsColor: .separatorColor).opacity(0.32))
+
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(leftPercent == nil ? Color.secondary.opacity(0.24) : color.opacity(0.78))
+                    .frame(width: max(0, width * progress))
+            }
+        }
+        .frame(height: 12)
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+    }
+
+    private var leftText: String {
+        guard let leftPercent else { return "-- left" }
+        return "\(Int(leftPercent.rounded()))% left"
+    }
+}
+
 private struct HealthBadge: View {
     let health: ProfileHealth
 
@@ -1639,9 +2036,9 @@ private struct HealthBadge: View {
             .foregroundStyle(color)
             .lineLimit(1)
             .truncationMode(.tail)
+            .frame(width: 82, alignment: .center)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .frame(maxWidth: 90, alignment: .trailing)
             .background(color.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 5))
             .help(health.detail)
@@ -1762,17 +2159,363 @@ private struct SecondaryActionButtonStyle: ButtonStyle {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class MenuBarState: ObservableObject {
+    @Published var selectedProfileID: String = ""
+    @Published var hoveredProfileID: String?
+}
+
+private struct MenuBarSwitcherView: View {
+    @ObservedObject var store: AccountStore
+    @ObservedObject var state: MenuBarState
+
+    let openManager: () -> Void
+    let refresh: () -> Void
+    let switchProfile: () -> Void
+    let quit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            MenuBarUsageView(snapshot: store.usageSnapshot(for: usageProfileID), profileName: usageProfileName)
+
+            if savedRows.isEmpty {
+                emptyState
+            } else {
+                accountList
+                switchButton
+            }
+
+            if !store.message.isEmpty {
+                messageRow
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Button(action: openManager) {
+                    Label("Open Manager", systemImage: "macwindow")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button(action: quit) {
+                    Label("Quit", systemImage: "power")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(14)
+        .frame(width: 310)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.2.badge.key.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 30, height: 30)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Codex Accounts")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(activeText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            Button(action: refresh) {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.borderless)
+            .disabled(store.isWorking)
+            .help("Refresh accounts")
+        }
+    }
+
+    private var accountList: some View {
+        ScrollView {
+            LazyVStack(spacing: 6) {
+                ForEach(savedRows) { row in
+                    Button {
+                        state.selectedProfileID = row.id
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: row.id == state.selectedProfileID ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(row.id == state.selectedProfileID ? Color.accentColor : .secondary)
+                                .frame(width: 18)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.displayName)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Text(row.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+
+                            Spacer(minLength: 6)
+
+                            if row.isActive {
+                                Text("Active")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.green)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(Color.green.opacity(0.12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                            }
+                        }
+                        .padding(9)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.45) : Color(nsColor: .separatorColor).opacity(0.28), lineWidth: 1)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isHovering in
+                        state.hoveredProfileID = isHovering ? row.id : nil
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 230)
+    }
+
+    private var switchButton: some View {
+        Button(action: switchProfile) {
+            Label(switchTitle, systemImage: "arrow.triangle.2.circlepath")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .disabled(!canSwitch)
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No saved accounts")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Open the manager to capture the current Codex account first.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var messageRow: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                .foregroundStyle(messageColor)
+            Text(store.message)
+                .font(.caption)
+                .foregroundStyle(messageColor)
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(8)
+        .background(messageColor.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var savedRows: [ProfileRow] {
+        store.rows.filter { !$0.isCurrentAuth }
+    }
+
+    private var selectedRow: ProfileRow? {
+        savedRows.first { $0.id == state.selectedProfileID }
+    }
+
+    private var activeText: String {
+        if let active = savedRows.first(where: { $0.id == store.activeProfile }) {
+            return "Active: \(active.displayName)"
+        }
+        return "No active account"
+    }
+
+    private var switchTitle: String {
+        guard let selectedRow else { return "Switch" }
+        return selectedRow.isActive ? "Already Active" : "Switch to \(selectedRow.displayName)"
+    }
+
+    private var canSwitch: Bool {
+        guard let selectedRow else { return false }
+        return !store.isWorking && !selectedRow.isActive
+    }
+
+    private var usageProfileID: String {
+        if let hoveredProfileID = state.hoveredProfileID {
+            return hoveredProfileID
+        }
+        if !state.selectedProfileID.isEmpty {
+            return state.selectedProfileID
+        }
+        if !store.activeProfile.isEmpty {
+            return store.activeProfile
+        }
+        return currentSelection
+    }
+
+    private var usageProfileName: String {
+        if let row = savedRows.first(where: { $0.id == usageProfileID }) {
+            return row.displayName
+        }
+        return usageProfileID == currentSelection ? "Current Codex" : usageProfileID
+    }
+
+    private var messageColor: Color {
+        let lower = store.message.lowercased()
+        if lower.contains("failed") || lower.contains("error") || lower.contains("cannot") {
+            return .red
+        }
+        if lower.contains("saved") || lower.contains("captured") || lower.contains("switched") || lower.contains("copied") {
+            return .green
+        }
+        return .secondary
+    }
+}
+
+private struct MenuBarUsageView: View {
+    let snapshot: CodexUsageSnapshot
+    let profileName: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "chart.bar.xaxis")
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 16)
+                Text("Codex Usage")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(profileName)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            MenuBarUsageMeterRow(
+                title: "Context",
+                leftPercent: snapshot.contextLeftPercent,
+                detail: "\(compactNumber(snapshot.contextUsed))/\(compactNumber(snapshot.contextWindow))"
+            )
+
+            MenuBarUsageMeterRow(
+                title: "5h",
+                leftPercent: snapshot.primaryLimit?.leftPercent,
+                detail: resetText(for: snapshot.primaryLimit)
+            )
+
+            MenuBarUsageMeterRow(
+                title: "7d",
+                leftPercent: snapshot.secondaryLimit?.leftPercent,
+                detail: resetText(for: snapshot.secondaryLimit)
+            )
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func resetText(for limit: UsageLimitWindow?) -> String {
+        guard let limit, let resetAt = limit.resetAt else { return "No data" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: resetAt, relativeTo: Date())
+    }
+
+    private func compactNumber(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            return "\(value / 1_000_000)M"
+        }
+        if value >= 1000 {
+            return "\(value / 1000)K"
+        }
+        return "\(value)"
+    }
+}
+
+private struct MenuBarUsageMeterRow: View {
+    let title: String
+    let leftPercent: Double?
+    let detail: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 46, alignment: .leading)
+
+            GeometryReader { proxy in
+                let progress = max(0, min(1, (leftPercent ?? 0) / 100))
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color(nsColor: .separatorColor).opacity(0.32))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(leftPercent == nil ? Color.secondary.opacity(0.25) : Color.accentColor.opacity(0.78))
+                        .frame(width: proxy.size.width * progress)
+                }
+            }
+            .frame(height: 9)
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(leftText)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(leftPercent == nil ? .secondary : .primary)
+                Text(detail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 76, alignment: .trailing)
+        }
+    }
+
+    private var leftText: String {
+        guard let leftPercent else { return "--%" }
+        return "\(Int(leftPercent.rounded()))%"
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let store = AccountStore()
+    private let menuBarState = MenuBarState()
     private var statusItem: NSStatusItem?
+    private var statusPopover: NSPopover?
+    private var localEventMonitor: Any?
+    private var globalEventMonitor: Any?
     private var window: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         debugLog("applicationDidFinishLaunching")
+        ProcessInfo.processInfo.disableAutomaticTermination("Codex Account Switcher stays available from the menu bar.")
         NSApp.setActivationPolicy(.regular)
         setupStatusItem()
-        rebuildMenu()
+        setupStatusPopover()
         setupMainMenu()
+        refreshMenuBarAccounts()
         DispatchQueue.main.async {
             self.showManager()
         }
@@ -1784,11 +2527,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) {
-        debugLog("applicationDidBecomeActive visible=\(window?.isVisible == true)")
-        if window == nil || window?.isVisible == false {
-            showManager()
-        }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     private func setupStatusItem() {
@@ -1800,8 +2540,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 button.image = image
             }
             button.title = " Codex"
+            button.target = self
+            button.action = #selector(toggleStatusPopover)
         }
         statusItem = item
+    }
+
+    private func setupStatusPopover() {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentSize = NSSize(width: 310, height: 520)
+        popover.contentViewController = NSHostingController(
+            rootView: MenuBarSwitcherView(
+                store: store,
+                state: menuBarState,
+                openManager: { [weak self] in
+                    self?.closeStatusPopover()
+                    self?.showManager()
+                },
+                refresh: { [weak self] in
+                    self?.refreshMenuBarAccounts()
+                },
+                switchProfile: { [weak self] in
+                    self?.switchSelectedMenuBarProfile()
+                },
+                quit: { [weak self] in
+                    self?.closeStatusPopover()
+                    self?.quit()
+                }
+            )
+        )
+        statusPopover = popover
     }
 
     private func setupMainMenu() {
@@ -1822,49 +2593,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    @objc private func rebuildMenu() {
-        store.reload()
-        let menu = NSMenu()
-
-        let active = store.activeProfile.isEmpty ? "No active profile" : "Active: \(store.activeProfile)"
-        let activeItem = NSMenuItem(title: active, action: nil, keyEquivalent: "")
-        activeItem.isEnabled = false
-        menu.addItem(activeItem)
-        menu.addItem(NSMenuItem.separator())
-
-        menu.addItem(NSMenuItem(title: "Open Manager", action: #selector(openManager), keyEquivalent: "m"))
-        menu.addItem(NSMenuItem(title: "Capture Current...", action: #selector(openManager), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open Codex", action: #selector(menuOpenCodex), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-
-        for row in store.rows where !row.isCurrentAuth {
-            let title = row.isActive ? "\(row.displayName)  (active)" : row.displayName
-            let item = NSMenuItem(title: title, action: #selector(menuSwitchProfile(_:)), keyEquivalent: "")
-            item.representedObject = row.id
-            item.target = self
-            item.isEnabled = !row.isActive
-            menu.addItem(item)
+    private func refreshMenuBarAccounts() {
+        store.reload(refreshUsage: false)
+        let savedRows = store.rows.filter { !$0.isCurrentAuth }
+        let selectedIsValid = savedRows.contains { $0.id == menuBarState.selectedProfileID }
+        if !selectedIsValid {
+            if savedRows.contains(where: { $0.id == store.activeProfile }) {
+                menuBarState.selectedProfileID = store.activeProfile
+            } else {
+                menuBarState.selectedProfileID = savedRows.first?.id ?? ""
+            }
         }
-
-        menu.addItem(NSMenuItem.separator())
-        let saveActiveItem = NSMenuItem(title: "Save Active State", action: #selector(menuSaveActiveState), keyEquivalent: "")
-        saveActiveItem.isEnabled = !store.activeProfile.isEmpty && !store.isWorking
-        menu.addItem(saveActiveItem)
-        let saveTokenItem = NSMenuItem(title: "Save Fresh Token", action: #selector(menuSaveFreshToken), keyEquivalent: "")
-        saveTokenItem.isEnabled = !store.activeProfile.isEmpty && !store.isWorking
-        menu.addItem(saveTokenItem)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Refresh", action: #selector(menuRefresh), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Open Profiles Folder", action: #selector(menuOpenFolder), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
-
-        statusItem?.menu = menu
-        statusItem?.button?.toolTip = active
+        statusItem?.button?.toolTip = store.activeProfile.isEmpty ? "Codex Accounts" : "Active: \(store.activeProfile)"
     }
 
     @objc private func openManager() {
         showManager()
+    }
+
+    @objc private func toggleStatusPopover() {
+        guard let button = statusItem?.button, let statusPopover else { return }
+        if statusPopover.isShown {
+            closeStatusPopover()
+            return
+        }
+        refreshMenuBarAccounts()
+        statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        startPopoverEventMonitoring()
     }
 
     private func showManager() {
@@ -1899,40 +2654,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("showManager end visible=\(window?.isVisible == true) frame=\(String(describing: window?.frame))")
     }
 
-    @objc private func menuSwitchProfile(_ sender: NSMenuItem) {
-        guard let profile = sender.representedObject as? String else { return }
+    private func switchSelectedMenuBarProfile() {
+        let profile = menuBarState.selectedProfileID
+        guard !profile.isEmpty, profile != store.activeProfile else { return }
         store.selectedID = profile
         store.loadSelected()
         store.switchSelected()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.rebuildMenu()
+    }
+
+    private func closeStatusPopover() {
+        statusPopover?.performClose(nil)
+        stopPopoverEventMonitoring()
+    }
+
+    private func startPopoverEventMonitoring() {
+        stopPopoverEventMonitoring()
+
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, self.statusPopover?.isShown == true else { return event }
+            let popoverWindow = self.statusPopover?.contentViewController?.view.window
+            let statusButtonWindow = self.statusItem?.button?.window
+            if event.window !== popoverWindow && event.window !== statusButtonWindow {
+                self.closeStatusPopover()
+            }
+            return event
+        }
+
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.closeStatusPopover()
         }
     }
 
-    @objc private func menuRefresh() {
-        rebuildMenu()
-    }
-
-    @objc private func menuOpenCodex() {
-        store.openCodex()
-    }
-
-    @objc private func menuSaveActiveState() {
-        store.saveActiveProfile()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.rebuildMenu()
+    private func stopPopoverEventMonitoring() {
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+            self.localEventMonitor = nil
+        }
+        if let globalEventMonitor {
+            NSEvent.removeMonitor(globalEventMonitor)
+            self.globalEventMonitor = nil
         }
     }
 
-    @objc private func menuSaveFreshToken() {
-        store.saveActiveAuthNow()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.rebuildMenu()
-        }
-    }
-
-    @objc private func menuOpenFolder() {
-        store.openProfilesFolder()
+    func popoverDidClose(_ notification: Notification) {
+        stopPopoverEventMonitoring()
     }
 
     @objc private func quit() {
