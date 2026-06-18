@@ -196,6 +196,9 @@ final class AccountStore: ObservableObject {
     private let codexHome: URL
     private let codexAppSupport: URL
     private let managedHomesRoot: URL
+    private let liveUsageCacheTTL: TimeInterval = 60
+    private let liveUsageCacheLock = NSLock()
+    private var liveUsageCache: [String: (fetchedAt: Date, snapshot: RateLimitSnapshot)] = [:]
     private var autoSaveTimer: Timer?
     private var isAutoSaving = false
     private var lastAutoSaveFingerprint = ""
@@ -883,10 +886,30 @@ final class AccountStore: ObservableObject {
     }
 
     private func readUsageSnapshot(forProfile profileID: String, minRateLimitDate: Date?) -> CodexUsageSnapshot? {
+        let liveLimits = readLiveRateLimits(forProfile: profileID)
         for root in usageRoots(forProfile: profileID) {
             if let snapshot = readUsageSnapshot(from: root, minRateLimitDate: minRateLimitDate) {
-                return snapshot
+                return CodexUsageSnapshot(
+                    contextUsed: snapshot.contextUsed,
+                    contextWindow: snapshot.contextWindow,
+                    model: snapshot.model,
+                    updatedAt: snapshot.updatedAt,
+                    observedAt: liveLimits?.observedAt ?? snapshot.observedAt,
+                    primaryLimit: liveLimits?.primary ?? snapshot.primaryLimit,
+                    secondaryLimit: liveLimits?.secondary ?? snapshot.secondaryLimit
+                )
             }
+        }
+        if let liveLimits {
+            return CodexUsageSnapshot(
+                contextUsed: 0,
+                contextWindow: 272000,
+                model: "-",
+                updatedAt: nil,
+                observedAt: liveLimits.observedAt,
+                primaryLimit: liveLimits.primary,
+                secondaryLimit: liveLimits.secondary
+            )
         }
         return nil
     }
@@ -945,6 +968,248 @@ final class AccountStore: ObservableObject {
         }
         var seen: Set<String> = []
         return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
+    private func usageAuthURLs(forProfile profileID: String) -> [URL] {
+        var urls: [URL] = []
+        if profileID == currentSelection || profileID == activeProfile {
+            urls.append(Self.currentAuthURL())
+        }
+        if profileID != currentSelection {
+            urls.append(profileAuthURL(profileID))
+            let managedHome = profileEnvValue(profileID, key: "managed_codex_home", fallback: "")
+            if !managedHome.isEmpty {
+                urls.append(URL(fileURLWithPath: managedHome, isDirectory: true).appendingPathComponent("auth.json"))
+            }
+        }
+        var seen: Set<String> = []
+        return urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
+    private func readLiveRateLimits(forProfile profileID: String) -> RateLimitSnapshot? {
+        for authURL in usageAuthURLs(forProfile: profileID) {
+            guard FileManager.default.fileExists(atPath: authURL.path) else { continue }
+            let cacheKey = liveUsageCacheKey(for: authURL)
+            if let cached = cachedLiveRateLimits(forKey: cacheKey) {
+                return cached
+            }
+            if let snapshot = fetchLiveCodexRateLimits(authURL: authURL, initialCacheKey: cacheKey) {
+                return snapshot
+            }
+        }
+        return nil
+    }
+
+    private func cachedLiveRateLimits(forKey cacheKey: String) -> RateLimitSnapshot? {
+        liveUsageCacheLock.lock()
+        defer { liveUsageCacheLock.unlock() }
+        guard let cached = liveUsageCache[cacheKey],
+              Date().timeIntervalSince(cached.fetchedAt) < liveUsageCacheTTL else {
+            return nil
+        }
+        return cached.snapshot
+    }
+
+    private func cacheLiveRateLimits(_ snapshot: RateLimitSnapshot, forKey cacheKey: String) {
+        liveUsageCacheLock.lock()
+        liveUsageCache[cacheKey] = (Date(), snapshot)
+        liveUsageCacheLock.unlock()
+    }
+
+    private func liveUsageCacheKey(for authURL: URL) -> String {
+        let path = authURL.standardizedFileURL.path
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return path
+        }
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        return "\(path):\(size):\(modifiedAt)"
+    }
+
+    private func fetchLiveCodexRateLimits(authURL: URL, initialCacheKey: String) -> RateLimitSnapshot? {
+        guard let token = codexAccessTokenFresh(authURL: authURL) else {
+            return nil
+        }
+
+        let cacheKey = liveUsageCacheKey(for: authURL)
+        if cacheKey != initialCacheKey, let cached = cachedLiveRateLimits(forKey: cacheKey) {
+            return cached
+        }
+
+        guard let url = URL(string: "https://chatgpt.com/backend-api/wham/usage"),
+              let raw = requestJSON(
+                url: url,
+                method: "GET",
+                headers: [
+                    "Authorization": "Bearer \(token)",
+                    "Accept": "application/json"
+                ],
+                body: nil
+              ),
+              let snapshot = parseCodexUsageEndpoint(raw) else {
+            return nil
+        }
+        cacheLiveRateLimits(snapshot, forKey: cacheKey)
+        return snapshot
+    }
+
+    private func codexAccessTokenFresh(authURL: URL) -> String? {
+        guard let data = try? Data(contentsOf: authURL),
+              var raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        var tokenMap = raw["tokens"] as? [String: Any] ?? [:]
+        let accessToken = firstString([tokenMap["access_token"], tokenMap["accessToken"]])
+        guard !accessToken.isEmpty else { return nil }
+
+        let refreshThreshold = Date().addingTimeInterval(300)
+        if tokenExpiryDate(accessToken).map({ $0 > refreshThreshold }) ?? true {
+            return accessToken
+        }
+
+        let refreshToken = firstString([tokenMap["refresh_token"], tokenMap["refreshToken"]])
+        guard !refreshToken.isEmpty,
+              let refreshed = refreshCodexTokens(refreshToken: refreshToken) else {
+            return nil
+        }
+        let newAccessToken = firstString([refreshed["access_token"], refreshed["accessToken"]])
+        guard !newAccessToken.isEmpty else { return nil }
+
+        updateTokenMap(&tokenMap, snakeKey: "access_token", camelKey: "accessToken", value: newAccessToken)
+        for (snakeKey, camelKey) in [("refresh_token", "refreshToken"), ("id_token", "idToken")] {
+            let value = firstString([refreshed[snakeKey], refreshed[camelKey]])
+            if !value.isEmpty {
+                updateTokenMap(&tokenMap, snakeKey: snakeKey, camelKey: camelKey, value: value)
+            }
+        }
+        raw["tokens"] = tokenMap
+        raw["last_refresh"] = ISO8601DateFormatter().string(from: Date())
+        writeCodexAuth(raw, to: authURL)
+        return newAccessToken
+    }
+
+    private func refreshCodexTokens(refreshToken: String) -> [String: Any]? {
+        guard let url = URL(string: "https://auth.openai.com/oauth/token"),
+              let body = formURLEncodedData([
+                ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refreshToken)
+              ]) else {
+            return nil
+        }
+        return requestJSON(
+            url: url,
+            method: "POST",
+            headers: [
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
+            ],
+            body: body
+        )
+    }
+
+    private func updateTokenMap(_ tokenMap: inout [String: Any], snakeKey: String, camelKey: String, value: String) {
+        tokenMap[snakeKey] = value
+        if tokenMap[camelKey] != nil {
+            tokenMap[camelKey] = value
+        }
+    }
+
+    private func writeCodexAuth(_ raw: [String: Any], to authURL: URL) {
+        guard JSONSerialization.isValidJSONObject(raw),
+              let data = try? JSONSerialization.data(withJSONObject: raw, options: [.prettyPrinted, .sortedKeys]) else {
+            return
+        }
+        do {
+            try data.write(to: authURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authURL.path)
+        } catch {
+            debugLog("could not write refreshed Codex auth: \(error.localizedDescription)")
+        }
+    }
+
+    private func requestJSON(url: URL, method: String, headers: [String: String], body: Data?) -> [String: Any]? {
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = method
+        request.httpBody = body
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [String: Any]?
+        var statusCode = 0
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+            if let error {
+                debugLog("usage endpoint request failed: \(error.localizedDescription)")
+                return
+            }
+            statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode),
+                  let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+            result = json
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 25) == .timedOut {
+            task.cancel()
+            debugLog("usage endpoint request timed out")
+            return nil
+        }
+        if statusCode >= 400 {
+            debugLog("usage endpoint returned HTTP \(statusCode)")
+        }
+        return result
+    }
+
+    private func parseCodexUsageEndpoint(_ raw: [String: Any]) -> RateLimitSnapshot? {
+        guard let rateLimit = raw["rate_limit"] as? [String: Any] else {
+            return nil
+        }
+
+        var primary: UsageLimitWindow?
+        var secondary: UsageLimitWindow?
+        for key in ["primary_window", "secondary_window"] {
+            guard let window = rateLimit[key] as? [String: Any],
+                  let usedPercent = doubleValue(window["used_percent"]) else {
+                continue
+            }
+            let windowSeconds = intValue(window["limit_window_seconds"])
+                ?? intValue(window["window_seconds"])
+                ?? (key == "secondary_window" ? 604800 : 18000)
+            let resetAt = doubleValue(window["reset_at"]).map { Date(timeIntervalSince1970: $0) }
+            let parsed = UsageLimitWindow(
+                usedPercent: max(0, min(100, usedPercent)),
+                windowMinutes: max(1, windowSeconds / 60),
+                resetAt: resetAt
+            )
+            if key == "secondary_window" || windowSeconds >= 86_400 {
+                secondary = parsed
+            } else {
+                primary = parsed
+            }
+        }
+
+        guard primary != nil || secondary != nil else {
+            return nil
+        }
+        return RateLimitSnapshot(primary: primary, secondary: secondary, observedAt: Date())
+    }
+
+    private func formURLEncodedData(_ pairs: [(String, String)]) -> Data? {
+        let body = pairs
+            .map { "\(formEncode($0.0))=\(formEncode($0.1))" }
+            .joined(separator: "&")
+        return body.data(using: .utf8)
+    }
+
+    private func formEncode(_ value: String) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: ":#[]@!$&'()*+,;=")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
     private func contextWindowForModel(_ model: String) -> Int {
@@ -1558,7 +1823,8 @@ struct ManagerView: View {
                         ProfileCardButton(
                             row: row,
                             isSelected: store.selectedID == row.id,
-                            privacyMode: store.privacyMode
+                            privacyMode: store.privacyMode,
+                            snapshot: store.usageSnapshot(for: row.id)
                         ) {
                             store.selectedID = row.id
                         } onHover: { isHovering in
@@ -1661,6 +1927,7 @@ struct ManagerView: View {
     private var detail: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                dashboardPanel
                 headerPanel
                 actionPanel
                 usagePanel
@@ -1672,6 +1939,71 @@ struct ManagerView: View {
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+    }
+
+    private var dashboardPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Manager Dashboard", systemImage: "rectangle.grid.2x2.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text("Active \(activeProfileDisplay) | \(profileCount) saved profiles")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    store.reload()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(store.isWorking)
+            }
+
+            HStack(spacing: 10) {
+                FleetStatTile(
+                    title: "Active",
+                    value: activeProfileDisplay,
+                    systemImage: "bolt.fill",
+                    color: .green
+                )
+                FleetStatTile(
+                    title: "Ready",
+                    value: profileCount == 0 ? "0/0" : "\(readyProfileCount)/\(profileCount)",
+                    systemImage: "checkmark.seal.fill",
+                    color: .blue
+                )
+                FleetStatTile(
+                    title: "Quota Risk",
+                    value: "\(quotaRiskCount)",
+                    systemImage: quotaRiskCount == 0 ? "gauge.with.dots.needle.0percent" : "gauge.with.dots.needle.100percent",
+                    color: quotaRiskCount == 0 ? .green : .orange
+                )
+                FleetStatTile(
+                    title: "Live Update",
+                    value: latestUsageText,
+                    systemImage: "antenna.radiowaves.left.and.right",
+                    color: .cyan
+                )
+            }
+
+            LazyVGrid(columns: dashboardColumns, alignment: .leading, spacing: 12) {
+                ForEach(dashboardRows) { row in
+                    DashboardAccountCard(
+                        row: row,
+                        snapshot: store.usageSnapshot(for: row.id),
+                        isSelected: store.selectedID == row.id,
+                        privacyMode: store.privacyMode
+                    ) {
+                        store.selectedID = row.id
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent, isProminent: true)
     }
 
     private var headerPanel: some View {
@@ -1925,6 +2257,17 @@ struct ManagerView: View {
                     resetText: resetText(for: snapshot.secondaryLimit),
                     color: .orange
                 )
+
+                HStack(spacing: 8) {
+                    Label(snapshot.observedAt == nil ? "Local fallback" : "Live endpoint", systemImage: snapshot.observedAt == nil ? "clock.badge.questionmark" : "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(snapshot.observedAt == nil ? Color.secondary : Color.cyan)
+                    Spacer()
+                    Text(usageUpdatedText(snapshot))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
     }
@@ -2014,8 +2357,48 @@ struct ManagerView: View {
         }
     }
 
+    private var dashboardColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 12)]
+    }
+
+    private var dashboardRows: [ProfileRow] {
+        store.rows
+    }
+
     private var profileCount: Int {
         store.rows.filter { !$0.isCurrentAuth }.count
+    }
+
+    private var activeProfileDisplay: String {
+        if let active = store.rows.first(where: { $0.id == store.activeProfile }) {
+            return active.displayName
+        }
+        return store.activeProfile.isEmpty ? "None" : store.activeProfile
+    }
+
+    private var readyProfileCount: Int {
+        store.rows
+            .filter { !$0.isCurrentAuth }
+            .filter { $0.health.level == .healthy }
+            .count
+    }
+
+    private var quotaRiskCount: Int {
+        dashboardRows.filter { row in
+            let snapshot = store.usageSnapshot(for: row.id)
+            return snapshot.primaryLimit?.usedPercent ?? 0 >= 90
+                || snapshot.secondaryLimit?.usedPercent ?? 0 >= 90
+        }.count
+    }
+
+    private var latestUsageText: String {
+        let latest = dashboardRows
+            .compactMap { store.usageSnapshot(for: $0.id).observedAt }
+            .max()
+        guard let latest else { return "No live data" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: latest, relativeTo: Date())
     }
 
     private var selectedSubtitle: String {
@@ -2111,6 +2494,20 @@ struct ManagerView: View {
         return "resets \(formatter.localizedString(for: resetAt, relativeTo: Date()))"
     }
 
+    private func usageUpdatedText(_ snapshot: CodexUsageSnapshot) -> String {
+        if let observedAt = snapshot.observedAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            return "quota updated \(formatter.localizedString(for: observedAt, relativeTo: Date()))"
+        }
+        if let updatedAt = snapshot.updatedAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            return "thread updated \(formatter.localizedString(for: updatedAt, relativeTo: Date()))"
+        }
+        return "waiting for usage data"
+    }
+
     private func formatNumber(_ value: Int) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -2129,47 +2526,52 @@ private struct ProfileCardButton: View {
     let row: ProfileRow
     let isSelected: Bool
     let privacyMode: Bool
+    let snapshot: CodexUsageSnapshot
     let action: () -> Void
     let onHover: (Bool) -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: row.isCurrentAuth ? "bolt.circle.fill" : "person.crop.circle")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(iconColor)
-                    .frame(width: 34, height: 34)
-                    .background(iconColor.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: row.isCurrentAuth ? "bolt.circle.fill" : "person.crop.circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(iconColor)
+                        .frame(width: 34, height: 34)
+                        .background(iconColor.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
 
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(row.displayName)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Text(masked(row.subtitle))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(masked(row.meta))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .layoutPriority(1)
-
-                Spacer(minLength: 4)
-
-                VStack(alignment: .trailing, spacing: 6) {
-                    if row.isActive {
-                        StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(row.displayName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Text(masked(row.subtitle))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(masked(row.meta))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
-                    HealthBadge(health: row.health)
+                    .layoutPriority(1)
+
+                    Spacer(minLength: 4)
+
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if row.isActive {
+                            StatusPill(text: "Active", color: .green, systemImage: "checkmark.circle.fill")
+                        }
+                        HealthBadge(health: row.health)
+                    }
+                    .frame(width: 92, alignment: .trailing)
                 }
-                .frame(width: 92, alignment: .trailing)
+
+                MiniQuotaStrip(snapshot: snapshot)
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2209,6 +2611,296 @@ private struct ProfileCardButton: View {
     private var cardBackground: Color {
         isSelected ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.035)
     }
+}
+
+private struct FleetStatTile: View {
+    let title: String
+    let value: String
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 28, height: 28)
+                .background(color.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(value)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.82)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 54)
+        .liquidGlass(cornerRadius: 8, tint: color)
+    }
+}
+
+private struct DashboardAccountCard: View {
+    let row: ProfileRow
+    let snapshot: CodexUsageSnapshot
+    let isSelected: Bool
+    let privacyMode: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: row.isCurrentAuth ? "bolt.circle.fill" : "person.crop.circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(iconColor)
+                        .frame(width: 36, height: 36)
+                        .background(iconColor.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(row.displayName)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            if row.isActive {
+                                Circle()
+                                    .fill(Color.green)
+                                    .frame(width: 7, height: 7)
+                            }
+                        }
+                        Text(masked(row.subtitle))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .layoutPriority(1)
+
+                    HealthBadge(health: row.health)
+                }
+
+                VStack(spacing: 8) {
+                    DashboardQuotaLine(title: "5h", limit: snapshot.primaryLimit, color: .green)
+                    DashboardQuotaLine(title: "7d", limit: snapshot.secondaryLimit, color: .orange)
+                    DashboardQuotaLine(
+                        title: "Ctx",
+                        usedPercent: contextUsedPercent,
+                        detail: contextDetail,
+                        color: .blue
+                    )
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: snapshot.observedAt == nil ? "clock.badge.questionmark" : "antenna.radiowaves.left.and.right")
+                        .foregroundStyle(.secondary)
+                    Text(observedText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, minHeight: 172, alignment: .topLeading)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.white.opacity(0.035))
+                    )
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isSelected ? Color.accentColor.opacity(0.70) : Color.white.opacity(0.12), lineWidth: isSelected ? 1.3 : 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var iconColor: Color {
+        row.isCurrentAuth ? .blue : (row.isActive ? .green : .indigo)
+    }
+
+    private var contextUsedPercent: Double? {
+        guard snapshot.contextWindow > 0, snapshot.contextUsed > 0 else { return nil }
+        return max(0, min(100, Double(snapshot.contextUsed) / Double(snapshot.contextWindow) * 100))
+    }
+
+    private var contextDetail: String {
+        guard snapshot.contextUsed > 0 else { return "No thread" }
+        return "\(compactNumber(snapshot.contextUsed))/\(compactNumber(snapshot.contextWindow))"
+    }
+
+    private var observedText: String {
+        guard let observedAt = snapshot.observedAt else { return "No live quota yet" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "Live \(formatter.localizedString(for: observedAt, relativeTo: Date()))"
+    }
+
+    private func masked(_ value: String) -> String {
+        guard privacyMode else { return value }
+        if let range = value.range(of: #"[\w.+-]+@[\w.-]+"#, options: .regularExpression) {
+            let email = String(value[range])
+            let parts = email.split(separator: "@", maxSplits: 1).map(String.init)
+            let maskedEmail = "\(String((parts.first ?? "").prefix(2)))***@\(parts.count > 1 ? parts[1] : "")"
+            return value.replacingCharacters(in: range, with: maskedEmail)
+        }
+        return value
+    }
+
+    private func compactNumber(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            return "\(value / 1_000_000)M"
+        }
+        if value >= 1000 {
+            return "\(value / 1000)K"
+        }
+        return "\(value)"
+    }
+}
+
+private struct MiniQuotaStrip: View {
+    let snapshot: CodexUsageSnapshot
+
+    var body: some View {
+        HStack(spacing: 8) {
+            MiniQuotaBar(title: "5h", limit: snapshot.primaryLimit, color: .green)
+            MiniQuotaBar(title: "7d", limit: snapshot.secondaryLimit, color: .orange)
+        }
+    }
+}
+
+private struct MiniQuotaBar: View {
+    let title: String
+    let limit: UsageLimitWindow?
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 2)
+                Text(percentText)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(limit == nil ? .secondary : levelColor)
+            }
+            QuotaProgressBar(usedPercent: limit?.usedPercent, color: levelColor)
+                .frame(height: 6)
+        }
+    }
+
+    private var percentText: String {
+        guard let limit else { return "--" }
+        return "\(Int(limit.usedPercent.rounded()))%"
+    }
+
+    private var levelColor: Color {
+        quotaLevelColor(limit?.usedPercent, fallback: color)
+    }
+}
+
+private struct DashboardQuotaLine: View {
+    let title: String
+    let usedPercent: Double?
+    let detail: String
+    let color: Color
+
+    init(title: String, limit: UsageLimitWindow?, color: Color) {
+        self.title = title
+        self.usedPercent = limit?.usedPercent
+        self.detail = DashboardQuotaLine.resetText(for: limit)
+        self.color = color
+    }
+
+    init(title: String, usedPercent: Double?, detail: String, color: Color) {
+        self.title = title
+        self.usedPercent = usedPercent
+        self.detail = detail
+        self.color = color
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .leading)
+
+            QuotaProgressBar(usedPercent: usedPercent, color: levelColor)
+                .frame(height: 8)
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(percentText)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(usedPercent == nil ? .secondary : levelColor)
+                Text(detail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(width: 74, alignment: .trailing)
+        }
+    }
+
+    private var percentText: String {
+        guard let usedPercent else { return "--%" }
+        return "\(Int(usedPercent.rounded()))%"
+    }
+
+    private var levelColor: Color {
+        quotaLevelColor(usedPercent, fallback: color)
+    }
+
+    private static func resetText(for limit: UsageLimitWindow?) -> String {
+        guard let limit else { return "No data" }
+        guard let resetAt = limit.resetAt else { return "Reset ?" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: resetAt, relativeTo: Date())
+    }
+}
+
+private struct QuotaProgressBar: View {
+    let usedPercent: Double?
+    let color: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            let progress = max(0, min(1, (usedPercent ?? 0) / 100))
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(Color(nsColor: .separatorColor).opacity(0.30))
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(usedPercent == nil ? Color.secondary.opacity(0.24) : color.opacity(0.82))
+                    .frame(width: proxy.size.width * progress)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+    }
+}
+
+private func quotaLevelColor(_ usedPercent: Double?, fallback: Color) -> Color {
+    guard let usedPercent else { return .secondary }
+    if usedPercent >= 90 { return .red }
+    if usedPercent >= 70 { return .orange }
+    return fallback
 }
 
 private struct StatusPill: View {
@@ -2473,6 +3165,505 @@ private struct SecondaryActionButtonStyle: ButtonStyle {
 final class MenuBarState: ObservableObject {
     @Published var selectedProfileID: String = ""
     @Published var hoveredProfileID: String?
+}
+
+private struct ManagerDashboardView: View {
+    @ObservedObject var store: AccountStore
+
+    var body: some View {
+        HStack(spacing: 0) {
+            sidebar
+            mainPane
+        }
+        .background(LiquidGlassBackground(themeMode: store.themeMode))
+        .preferredColorScheme(store.themeMode.colorScheme)
+        .tint(store.themeMode.accent)
+        .frame(minWidth: 1120, minHeight: 640)
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 10) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(Color.orange)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Codex")
+                            .font(.system(size: 18, weight: .bold))
+                        Text("Account manager")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text("Bare command = \(activeProfileDisplay == "None" ? "default" : activeProfileDisplay)")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .liquidGlass(cornerRadius: 8, tint: .orange, isProminent: true)
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                Button {
+                    store.setThemeMode(store.themeMode == .dark ? .light : .dark)
+                } label: {
+                    Image(systemName: store.themeMode.systemImage)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.borderless)
+                .help("Switch theme")
+
+                Button {
+                    store.togglePrivacyMode()
+                } label: {
+                    Image(systemName: store.privacyMode ? "eye.slash" : "eye")
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.borderless)
+                .help(store.privacyMode ? "Show details" : "Hide details")
+
+                Button {
+                    store.openProfilesFolder()
+                } label: {
+                    Image(systemName: "folder")
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.borderless)
+                .help("Profiles folder")
+            }
+            .padding(8)
+            .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 54)
+        .padding(.bottom, 18)
+        .frame(width: 270)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(store.themeMode == .dark ? 0.06 : 0.18))
+                .frame(width: 1)
+        }
+    }
+
+    private var mainPane: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            header
+
+            ScrollView {
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 18) {
+                    ForEach(store.rows) { row in
+                        AccountQuotaCard(
+                            row: row,
+                            snapshot: store.usageSnapshot(for: row.id),
+                            isSelected: store.selectedID == row.id,
+                            privacyMode: store.privacyMode,
+                            canUse: canUse(row),
+                            useAction: {
+                                select(row)
+                                store.switchSelected()
+                            },
+                            refreshAction: {
+                                select(row)
+                                store.refreshUsageSnapshotsAsync()
+                            },
+                            deleteAction: {
+                                select(row)
+                                confirmDelete()
+                            }
+                        )
+                    }
+                }
+                .padding(.bottom, 28)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: messageIcon)
+                    .foregroundStyle(messageColor)
+                Text(statusDisplayText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .liquidGlass(cornerRadius: 8, tint: messageColor)
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 54)
+        .padding(.bottom, 18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text("Codex")
+                .font(.system(size: 26, weight: .bold))
+
+            StatusChip(text: "Ready", color: .green, systemImage: nil)
+
+            Spacer()
+
+            Button {
+                store.addAccountWithCodexLogin()
+            } label: {
+                Label("Add account", systemImage: "arrow.right.to.line.compact")
+            }
+            .buttonStyle(GlassToolbarButtonStyle())
+            .disabled(store.isWorking)
+
+            Button {
+                store.reload()
+            } label: {
+                Label("Refresh quota", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(GlassToolbarButtonStyle())
+            .disabled(store.isWorking)
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 22)
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent, isProminent: true)
+    }
+
+    private var gridColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 360, maximum: 440), spacing: 18)]
+    }
+
+    private var activeProfileDisplay: String {
+        if let active = store.rows.first(where: { $0.id == store.activeProfile }) {
+            return active.displayName
+        }
+        return store.activeProfile.isEmpty ? "None" : store.activeProfile
+    }
+
+    private var messageColor: Color {
+        let lower = store.message.lowercased()
+        if lower.contains("failed") || lower.contains("error") || lower.contains("khong") || lower.contains("cannot") {
+            return .red
+        }
+        if lower.contains("saved") || lower.contains("captured") || lower.contains("switched") || lower.contains("copied") || lower.contains("added") {
+            return .green
+        }
+        return .secondary
+    }
+
+    private var messageIcon: String {
+        messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill"
+    }
+
+    private var statusDisplayText: String {
+        let trimmed = store.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("Starting local login server") {
+            return "Login started. Continue in the browser, then return here."
+        }
+        return trimmed.isEmpty ? "Ready" : trimmed
+    }
+
+    private func select(_ row: ProfileRow) {
+        store.selectedID = row.id
+        store.loadSelected()
+    }
+
+    private func canUse(_ row: ProfileRow) -> Bool {
+        !store.isWorking && !row.isCurrentAuth && !row.isActive
+    }
+
+    private func confirmDelete() {
+        let alert = NSAlert()
+        alert.messageText = "Delete profile \(store.selectedID)?"
+        alert.informativeText = "This removes the saved auth and Codex Desktop state for this profile from the switcher store."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.deleteSelected()
+        }
+    }
+}
+
+private struct AccountQuotaCard: View {
+    let row: ProfileRow
+    let snapshot: CodexUsageSnapshot
+    let isSelected: Bool
+    let privacyMode: Bool
+    let canUse: Bool
+    let useAction: () -> Void
+    let refreshAction: () -> Void
+    let deleteAction: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        if row.isActive {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 9, height: 9)
+                                .shadow(color: Color.green.opacity(0.45), radius: 6)
+                        }
+
+                        Text(row.displayName)
+                            .font(.system(size: 17, weight: .bold))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+
+                        PlanBadge(text: planText)
+                    }
+
+                    Text(row.isCurrentAuth ? "Machine default" : masked(row.subtitle))
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer(minLength: 8)
+
+                StatusChip(text: row.isActive ? "In use" : row.health.title, color: row.isActive ? .green : healthColor, systemImage: nil)
+            }
+
+            VStack(spacing: 13) {
+                CardQuotaLine(title: "5-hour limit", limit: snapshot.primaryLimit, color: .green)
+                CardQuotaLine(title: "Weekly limit", limit: snapshot.secondaryLimit, color: .green)
+            }
+
+            HStack(spacing: 10) {
+                Button(action: useAction) {
+                    Label("Use", systemImage: "arrow.counterclockwise")
+                        .frame(minWidth: 68)
+                }
+                .buttonStyle(CardActionButtonStyle(color: .secondary))
+                .disabled(!canUse)
+
+                Spacer()
+
+                IconGlassButton(systemImage: "arrow.clockwise", color: .secondary, action: refreshAction)
+
+                if !row.isCurrentAuth {
+                    IconGlassButton(systemImage: "trash", color: .red, action: deleteAction)
+                        .disabled(row.isActive)
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 196, alignment: .topLeading)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? Color.orange.opacity(0.07) : Color.black.opacity(0.03))
+                )
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isSelected ? Color.orange.opacity(0.86) : Color.white.opacity(0.13), lineWidth: isSelected ? 1.5 : 1)
+        )
+        .shadow(color: Color.black.opacity(0.10), radius: 12, x: 0, y: 8)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var planText: String {
+        let pieces = row.meta.split(separator: "|", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let plan = pieces.first ?? ""
+        if plan.isEmpty || plan == "unknown plan" { return "PLAN" }
+        return plan.uppercased()
+    }
+
+    private var healthColor: Color {
+        switch row.health.level {
+        case .healthy: return .green
+        case .warning: return .orange
+        case .error: return .red
+        case .unknown: return .secondary
+        }
+    }
+
+    private func masked(_ value: String) -> String {
+        guard privacyMode else { return value }
+        if let range = value.range(of: #"[\w.+-]+@[\w.-]+"#, options: .regularExpression) {
+            let email = String(value[range])
+            let parts = email.split(separator: "@", maxSplits: 1).map(String.init)
+            let maskedEmail = "\(String((parts.first ?? "").prefix(2)))***@\(parts.count > 1 ? parts[1] : "")"
+            return value.replacingCharacters(in: range, with: maskedEmail)
+        }
+        return value
+    }
+}
+
+private struct CardQuotaLine: View {
+    let title: String
+    let limit: UsageLimitWindow?
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.88))
+                Spacer()
+                Text(percentText)
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.primary)
+                Text(resetText)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 92, alignment: .trailing)
+            }
+
+            QuotaProgressBar(usedPercent: limit?.usedPercent, color: levelColor)
+                .frame(height: 8)
+        }
+    }
+
+    private var percentText: String {
+        guard let limit else { return "--" }
+        return "\(Int(limit.usedPercent.rounded()))%"
+    }
+
+    private var resetText: String {
+        guard let resetAt = limit?.resetAt else { return "--/--, --:--" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM/dd, HH:mm"
+        return formatter.string(from: resetAt)
+    }
+
+    private var levelColor: Color {
+        quotaLevelColor(limit?.usedPercent, fallback: color)
+    }
+}
+
+private struct StatusChip: View {
+    let text: String
+    let color: Color
+    let systemImage: String?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .bold))
+            }
+            Text(text)
+                .font(.system(size: 12, weight: .bold))
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.13))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(color.opacity(0.18), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct PlanBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .heavy, design: .monospaced))
+            .foregroundStyle(Color.orange)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Color.orange.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+    }
+}
+
+private struct CommandBadge: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(text)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            Image(systemName: "doc.on.doc")
+                .font(.system(size: 10, weight: .semibold))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .stroke(Color.white.opacity(0.11), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+    }
+}
+
+private struct IconGlassButton: View {
+    let systemImage: String
+    let color: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 36, height: 36)
+        }
+        .buttonStyle(.plain)
+        .background(.ultraThinMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct GlassToolbarButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(configuration.isPressed ? 0.72 : 1)
+    }
+}
+
+private struct CardActionButtonStyle: ButtonStyle {
+    let color: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(color == .secondary ? Color.primary : color)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(configuration.isPressed ? 0.72 : 1)
+    }
 }
 
 private struct MenuBarSwitcherView: View {
@@ -2962,14 +4153,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func showManager() {
         debugLog("showManager start windowExists=\(window != nil)")
         if window == nil {
-            let controller = NSHostingController(rootView: ManagerView(store: store))
+            let controller = NSHostingController(rootView: ManagerDashboardView(store: store))
             let newWindow = NSWindow(contentViewController: controller)
             newWindow.title = "Codex Account Manager"
             newWindow.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             newWindow.isReleasedWhenClosed = false
             newWindow.collectionBehavior = [.moveToActiveSpace]
             newWindow.level = .floating
-            newWindow.minSize = NSSize(width: 980, height: 660)
+            newWindow.minSize = NSSize(width: 1120, height: 640)
             let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 80, y: 80, width: 1200, height: 800)
             let frame = NSRect(
                 x: visibleFrame.midX - 540,
