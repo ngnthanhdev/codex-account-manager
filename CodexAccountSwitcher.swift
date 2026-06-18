@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -7,6 +8,8 @@ import UniformTypeIdentifiers
 private let currentSelection = "__current_codex_auth__"
 private let usageSnapshotsDefaultsKey = "CodexAccountSwitcherUsageSnapshotsByProfile.v2"
 private let usageValidSinceDefaultsKey = "CodexAccountSwitcherUsageValidSinceByProfile.v2"
+private let managedHomesFolderName = "managed-codex-homes"
+private let themeModeDefaultsKey = "CodexAccountSwitcherThemeMode"
 
 private func debugLog(_ message: String) {
     let url = FileManager.default.homeDirectoryForCurrentUser
@@ -50,6 +53,41 @@ struct TokenStatus {
     let label: String
     let state: String
     let detail: String
+}
+
+enum AppThemeMode: String, CaseIterable, Identifiable {
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .light: return "sun.max.fill"
+        case .dark: return "moon.stars.fill"
+        }
+    }
+
+    var colorScheme: ColorScheme {
+        switch self {
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+
+    var accent: Color {
+        switch self {
+        case .light: return Color(red: 0.06, green: 0.43, blue: 0.92)
+        case .dark: return Color(red: 0.45, green: 0.72, blue: 1.0)
+        }
+    }
 }
 
 struct UsageLimitWindow: Codable {
@@ -142,6 +180,7 @@ final class AccountStore: ObservableObject {
     @Published var selectedTokenKey: String = "access_token"
     @Published var revealToken: Bool = false
     @Published var privacyMode: Bool
+    @Published var themeMode: AppThemeMode
     @Published var aliasDraft: String = ""
     @Published var isEditingAlias: Bool = false
     @Published var profileNameDraft: String = ""
@@ -155,6 +194,8 @@ final class AccountStore: ObservableObject {
     let switcherHome: URL
     private let scriptPath: String
     private let codexHome: URL
+    private let codexAppSupport: URL
+    private let managedHomesRoot: URL
     private var autoSaveTimer: Timer?
     private var isAutoSaving = false
     private var lastAutoSaveFingerprint = ""
@@ -166,6 +207,11 @@ final class AccountStore: ObservableObject {
             .appendingPathComponent("Application Support")
             .appendingPathComponent("CodexAccountSwitcher")
         codexHome = home.appendingPathComponent(".codex")
+        codexAppSupport = home
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Codex")
+        managedHomesRoot = switcherHome.appendingPathComponent(managedHomesFolderName)
 
         if let bundled = Bundle.main.path(forResource: "codex-account-switcher", ofType: "sh") {
             scriptPath = bundled
@@ -173,6 +219,8 @@ final class AccountStore: ObservableObject {
             scriptPath = FileManager.default.currentDirectoryPath + "/codex-account-switcher.sh"
         }
         privacyMode = UserDefaults.standard.bool(forKey: "CodexAccountSwitcherPrivacyMode")
+        let storedThemeMode = UserDefaults.standard.string(forKey: themeModeDefaultsKey) ?? AppThemeMode.dark.rawValue
+        themeMode = AppThemeMode(rawValue: storedThemeMode) ?? .dark
         usageSnapshotsByProfile = loadUsageSnapshotsByProfile()
         usageValidSinceByProfile = loadUsageValidSinceByProfile()
 
@@ -257,7 +305,30 @@ final class AccountStore: ObservableObject {
         }
         loadSelected()
         if refreshUsage {
-            refreshUsageSnapshotAsync()
+            refreshUsageSnapshotsAsync()
+        }
+    }
+
+    func refreshUsageSnapshotsAsync() {
+        let profileIDs = rows.map(\.id)
+        DispatchQueue.global(qos: .utility).async {
+            var snapshots: [String: CodexUsageSnapshot] = [:]
+            for profileID in profileIDs {
+                let minDate = self.usageValidSinceByProfile[profileID]
+                if let snapshot = self.readUsageSnapshot(forProfile: profileID, minRateLimitDate: minDate) {
+                    snapshots[profileID] = snapshot
+                }
+            }
+
+            DispatchQueue.main.async {
+                guard !snapshots.isEmpty else { return }
+                for (profileID, snapshot) in snapshots {
+                    self.usageSnapshotsByProfile[profileID] = snapshot
+                }
+                let activeID = self.activeProfile.isEmpty ? currentSelection : self.activeProfile
+                self.usageSnapshot = snapshots[activeID] ?? snapshots[currentSelection] ?? self.usageSnapshot
+                self.saveUsageSnapshotsByProfile()
+            }
         }
     }
 
@@ -265,7 +336,7 @@ final class AccountStore: ObservableObject {
         let profileID = activeProfile.isEmpty ? currentSelection : activeProfile
         let minDate = usageValidSinceByProfile[profileID]
         DispatchQueue.global(qos: .utility).async {
-            let snapshot = self.readUsageSnapshot(minRateLimitDate: minDate)
+            let snapshot = self.readUsageSnapshot(forProfile: profileID, minRateLimitDate: minDate)
             DispatchQueue.main.async {
                 guard let snapshot else { return }
                 self.usageSnapshot = snapshot
@@ -277,7 +348,7 @@ final class AccountStore: ObservableObject {
 
     func cacheUsageSnapshotForActiveProfile() {
         let profileID = activeProfile.isEmpty ? currentSelection : activeProfile
-        let snapshot = readUsageSnapshot(minRateLimitDate: usageValidSinceByProfile[profileID])
+        let snapshot = readUsageSnapshot(forProfile: profileID, minRateLimitDate: usageValidSinceByProfile[profileID])
         guard let snapshot else { return }
         usageSnapshot = snapshot
         usageSnapshotsByProfile[profileID] = snapshot
@@ -338,6 +409,11 @@ final class AccountStore: ObservableObject {
     func togglePrivacyMode() {
         privacyMode.toggle()
         UserDefaults.standard.set(privacyMode, forKey: "CodexAccountSwitcherPrivacyMode")
+    }
+
+    func setThemeMode(_ mode: AppThemeMode) {
+        themeMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: themeModeDefaultsKey)
     }
 
     func displaySensitive(_ value: String) -> String {
@@ -420,6 +496,40 @@ final class AccountStore: ObservableObject {
         perform(["capture", trimmed], successMessage: "Captured \(trimmed)") {
             self.selectedID = trimmed
             self.newProfileName = ""
+        }
+    }
+
+    func addAccountWithCodexLogin() {
+        guard !isWorking else { return }
+        let accountID = UUID()
+        let homeURL = managedHomesRoot.appendingPathComponent(accountID.uuidString, isDirectory: true)
+        isWorking = true
+        message = "Adding account... Complete the Codex login in the browser or terminal prompt."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.runCodexLogin(homeURL: homeURL, timeout: 120)
+            guard result.status == 0 else {
+                try? FileManager.default.removeItem(at: homeURL)
+                DispatchQueue.main.async {
+                    self.isWorking = false
+                    self.message = result.output.isEmpty ? "Codex login failed." : result.output
+                }
+                return
+            }
+
+            let profileName = self.profileNameForManagedHome(homeURL, fallbackID: accountID)
+            let importResult = self.run(["import-home", profileName, homeURL.path])
+            DispatchQueue.main.async {
+                self.isWorking = false
+                if importResult.status == 0 {
+                    self.selectedID = profileName
+                    self.message = "Added \(profileName)."
+                    self.reload()
+                } else {
+                    try? FileManager.default.removeItem(at: homeURL)
+                    self.message = importResult.output.isEmpty ? "Failed to import logged-in account." : importResult.output
+                }
+            }
         }
     }
 
@@ -582,10 +692,10 @@ final class AccountStore: ObservableObject {
         autoSaveTimer?.invalidate()
         autoSaveTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             self?.autoSaveActiveAuthIfNeeded()
-            self?.refreshUsageSnapshotAsync()
+            self?.refreshUsageSnapshotsAsync()
         }
         autoSaveActiveAuthIfNeeded()
-        refreshUsageSnapshotAsync()
+        refreshUsageSnapshotsAsync()
     }
 
     private func autoSaveActiveAuthIfNeeded() {
@@ -677,8 +787,112 @@ final class AccountStore: ObservableObject {
         }
     }
 
-    private func readUsageSnapshot(minRateLimitDate: Date?) -> CodexUsageSnapshot? {
-        let stateDB = codexHome.appendingPathComponent("state_5.sqlite")
+    private func runCodexLogin(homeURL: URL, timeout: TimeInterval) -> CommandResult {
+        do {
+            try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+        } catch {
+            return CommandResult(status: 1, output: error.localizedDescription)
+        }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        task.arguments = ["codex", "login"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["CODEX_HOME"] = homeURL.path
+        environment["PATH"] = effectiveLoginPath(environment["PATH"])
+        task.environment = environment
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        do {
+            try task.run()
+        } catch {
+            return CommandResult(status: 127, output: "Could not start `codex login`: \(error.localizedDescription)")
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if task.isRunning {
+            task.terminate()
+            Thread.sleep(forTimeInterval: 1)
+            if task.isRunning {
+                kill(task.processIdentifier, SIGKILL)
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return CommandResult(status: 124, output: output.isEmpty ? "Codex login timed out." : output)
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return CommandResult(status: task.terminationStatus, output: output)
+    }
+
+    private func effectiveLoginPath(_ currentPath: String?) -> String {
+        let fallback = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        guard let currentPath, !currentPath.isEmpty else { return fallback }
+        return "\(currentPath):\(fallback)"
+    }
+
+    private func profileNameForManagedHome(_ homeURL: URL, fallbackID: UUID) -> String {
+        let metadata = readAuthMetadata(
+            name: fallbackID.uuidString,
+            authURL: homeURL.appendingPathComponent("auth.json"),
+            capturedAt: "-",
+            alias: "",
+            desktopState: "-"
+        )
+        let base: String
+        if metadata.email != "-" {
+            base = metadata.email
+                .split(separator: "@")
+                .first
+                .map(String.init) ?? "codex"
+        } else if metadata.accountID != "-" {
+            base = String(metadata.accountID.prefix(12))
+        } else {
+            base = "codex"
+        }
+
+        let cleaned = base
+            .lowercased()
+            .map { character -> Character in
+                if character.isLetter || character.isNumber || character == "." || character == "_" || character == "-" {
+                    return character
+                }
+                return "-"
+            }
+        let prefix = String(cleaned).trimmingCharacters(in: CharacterSet(charactersIn: ".-_"))
+        let candidate = prefix.isEmpty ? "codex" : prefix
+        return uniqueProfileName(startingWith: candidate)
+    }
+
+    private func uniqueProfileName(startingWith base: String) -> String {
+        let profilesURL = switcherHome.appendingPathComponent("profiles")
+        var candidate = base
+        var index = 2
+        while FileManager.default.fileExists(atPath: profilesURL.appendingPathComponent(candidate).path) {
+            candidate = "\(base)-\(index)"
+            index += 1
+        }
+        return candidate
+    }
+
+    private func readUsageSnapshot(forProfile profileID: String, minRateLimitDate: Date?) -> CodexUsageSnapshot? {
+        for root in usageRoots(forProfile: profileID) {
+            if let snapshot = readUsageSnapshot(from: root, minRateLimitDate: minRateLimitDate) {
+                return snapshot
+            }
+        }
+        return nil
+    }
+
+    private func readUsageSnapshot(from root: URL, minRateLimitDate: Date?) -> CodexUsageSnapshot? {
+        let stateDB = root.appendingPathComponent("state_5.sqlite")
         guard FileManager.default.fileExists(atPath: stateDB.path) else {
             return nil
         }
@@ -702,19 +916,35 @@ final class AccountStore: ObservableObject {
         let model = parts[1].isEmpty ? "-" : parts[1]
         let updatedMillis = TimeInterval(parts[2]) ?? 0
         let contextWindow = contextWindowForModel(model)
-        guard let limits = readRateLimits(minDate: minRateLimitDate) else {
-            return nil
-        }
+        let limits = readRateLimits(from: root, minDate: minRateLimitDate)
 
         return CodexUsageSnapshot(
             contextUsed: used,
             contextWindow: contextWindow,
             model: model,
             updatedAt: updatedMillis > 0 ? Date(timeIntervalSince1970: updatedMillis / 1000) : nil,
-            observedAt: limits.observedAt,
-            primaryLimit: limits.primary,
-            secondaryLimit: limits.secondary
+            observedAt: limits?.observedAt,
+            primaryLimit: limits?.primary,
+            secondaryLimit: limits?.secondary
         )
+    }
+
+    private func usageRoots(forProfile profileID: String) -> [URL] {
+        var roots: [URL] = []
+        if profileID == currentSelection || profileID == activeProfile {
+            roots.append(codexHome)
+            roots.append(codexAppSupport)
+        }
+        if profileID != currentSelection {
+            let profileSupport = profileAppSupportURL(profileID)
+            roots.append(profileSupport)
+            let managedHome = profileEnvValue(profileID, key: "managed_codex_home", fallback: "")
+            if !managedHome.isEmpty {
+                roots.append(URL(fileURLWithPath: managedHome, isDirectory: true))
+            }
+        }
+        var seen: Set<String> = []
+        return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 
     private func contextWindowForModel(_ model: String) -> Int {
@@ -727,8 +957,8 @@ final class AccountStore: ObservableObject {
         return windows[model] ?? 272000
     }
 
-    private func readRateLimits(minDate: Date?) -> RateLimitSnapshot? {
-        let logsDB = codexHome.appendingPathComponent("logs_2.sqlite")
+    private func readRateLimits(from root: URL, minDate: Date?) -> RateLimitSnapshot? {
+        let logsDB = root.appendingPathComponent("logs_2.sqlite")
         guard FileManager.default.fileExists(atPath: logsDB.path) else {
             return nil
         }
@@ -1159,12 +1389,16 @@ final class AccountStore: ObservableObject {
     }
 
     private func profileDesktopState(_ name: String) -> String {
-        let url = switcherHome
+        let url = profileAppSupportURL(name)
+        return FileManager.default.fileExists(atPath: url.path) ? "Captured" : "Missing"
+    }
+
+    private func profileAppSupportURL(_ name: String) -> URL {
+        switcherHome
             .appendingPathComponent("profiles")
             .appendingPathComponent(name)
             .appendingPathComponent("app-support")
             .appendingPathComponent("Codex")
-        return FileManager.default.fileExists(atPath: url.path) ? "Captured" : "Missing"
     }
 
     private func profileCapturedAt(_ name: String) -> String {
@@ -1211,6 +1445,74 @@ final class AccountStore: ObservableObject {
     }
 }
 
+private struct LiquidGlassBackground: View {
+    let themeMode: AppThemeMode
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.regularMaterial)
+            LinearGradient(
+                colors: [
+                    themeMode.accent.opacity(themeMode == .dark ? 0.22 : 0.16),
+                    Color(nsColor: .windowBackgroundColor).opacity(themeMode == .dark ? 0.54 : 0.70),
+                    Color(nsColor: .controlAccentColor).opacity(themeMode == .dark ? 0.10 : 0.08)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Rectangle()
+                .fill(themeMode == .dark ? Color.black.opacity(0.18) : Color.white.opacity(0.10))
+        }
+        .ignoresSafeArea()
+    }
+}
+
+private struct LiquidGlassModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    let tint: Color
+    let isProminent: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(tint.opacity(isProminent ? 0.13 : 0.06))
+                    )
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(isProminent ? 0.30 : 0.20),
+                                tint.opacity(isProminent ? 0.28 : 0.16),
+                                Color.black.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+            .shadow(color: Color.black.opacity(isProminent ? 0.16 : 0.08), radius: isProminent ? 18 : 10, x: 0, y: isProminent ? 10 : 5)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+}
+
+private extension View {
+    func liquidGlass(
+        cornerRadius: CGFloat = 8,
+        tint: Color = Color.accentColor,
+        isProminent: Bool = false
+    ) -> some View {
+        modifier(LiquidGlassModifier(cornerRadius: cornerRadius, tint: tint, isProminent: isProminent))
+    }
+}
+
 struct ManagerView: View {
     @ObservedObject var store: AccountStore
     @State private var hoveredProfileID: String?
@@ -1218,10 +1520,14 @@ struct ManagerView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-            Divider().opacity(0.6)
+            Rectangle()
+                .fill(Color.white.opacity(store.themeMode == .dark ? 0.08 : 0.18))
+                .frame(width: 1)
             detail
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(LiquidGlassBackground(themeMode: store.themeMode))
+        .preferredColorScheme(store.themeMode.colorScheme)
+        .tint(store.themeMode.accent)
         .frame(minWidth: 980, minHeight: 660)
     }
 
@@ -1230,10 +1536,9 @@ struct ManagerView: View {
             HStack(spacing: 10) {
                 Image(systemName: "person.2.badge.key.fill")
                     .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(store.themeMode.accent)
                     .frame(width: 38, height: 38)
-                    .background(Color.accentColor.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent, isProminent: true)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex Manager")
@@ -1243,6 +1548,9 @@ struct ManagerView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .padding(.bottom, 2)
+
+            themeControl
 
             ScrollView {
                 LazyVStack(spacing: 8) {
@@ -1265,60 +1573,61 @@ struct ManagerView: View {
                 store.loadSelected()
             }
 
-            capturePanel
-            statusPanel
             utilityButtons
         }
         .padding(18)
         .frame(width: 320)
-        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.46))
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(store.themeMode == .dark ? 0.07 : 0.22))
+                .frame(width: 1)
+        }
     }
 
-    private var capturePanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Add profile", systemImage: "plus.circle.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
-
-            HStack {
-                TextField("profile name", text: $store.newProfileName)
-                    .textFieldStyle(.roundedBorder)
+    private var themeControl: some View {
+        HStack(spacing: 6) {
+            ForEach(AppThemeMode.allCases) { mode in
                 Button {
-                    store.captureCurrent()
+                    store.setThemeMode(mode)
                 } label: {
-                    Label("Capture", systemImage: "tray.and.arrow.down.fill")
+                    Label(mode.title, systemImage: mode.systemImage)
+                        .font(.system(size: 12, weight: .semibold))
+                        .labelStyle(.titleAndIcon)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
                 }
-                .disabled(store.isWorking)
+                .buttonStyle(.plain)
+                .foregroundStyle(store.themeMode == mode ? store.themeMode.accent : .secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(store.themeMode == mode ? store.themeMode.accent.opacity(0.16) : Color.clear)
+                )
             }
-
-            Button {
-                store.importAuthFile()
-            } label: {
-                Label("Import auth.json", systemImage: "square.and.arrow.down")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .disabled(store.isWorking)
         }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(4)
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
     }
 
     private var statusPanel: some View {
-        HStack(alignment: .top, spacing: 9) {
-            Image(systemName: messageIcon)
+        HStack(alignment: .center, spacing: 10) {
+            Label("Activity", systemImage: messageIcon)
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(messageColor)
-                .frame(width: 18)
-            Text(store.message)
-                .font(.caption)
-                .foregroundStyle(messageColor)
-                .lineLimit(4)
+                .frame(width: 92, alignment: .leading)
+
+            Text(statusDisplayText)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(10)
-        .background(messageColor.opacity(0.10))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .liquidGlass(cornerRadius: 8, tint: messageColor)
+        .help(store.message)
     }
 
     private var utilityButtons: some View {
@@ -1345,6 +1654,8 @@ struct ManagerView: View {
             }
         }
         .buttonStyle(.bordered)
+        .padding(10)
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
     }
 
     private var detail: some View {
@@ -1354,9 +1665,9 @@ struct ManagerView: View {
                 actionPanel
                 usagePanel
                 tokenStatusPanel
-                importExportPanel
                 metadataPanel
                 tokenVault
+                statusPanel
             }
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -1370,8 +1681,7 @@ struct ManagerView: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundStyle(selectedIconColor)
                     .frame(width: 54, height: 54)
-                    .background(selectedIconColor.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .liquidGlass(cornerRadius: 8, tint: selectedIconColor, isProminent: true)
 
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 8) {
@@ -1412,8 +1722,7 @@ struct ManagerView: View {
             }
         }
         .padding(18)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: selectedIconColor, isProminent: true)
     }
 
     private var aliasHeader: some View {
@@ -1502,8 +1811,42 @@ struct ManagerView: View {
 
     private var actionPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Account Actions")
-                .font(.headline)
+            HStack {
+                Label("Account Actions", systemImage: "person.crop.circle.badge.gearshape")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    store.addAccountWithCodexLogin()
+                } label: {
+                    Label(store.isWorking ? "Adding..." : "Add Account", systemImage: "person.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(store.isWorking)
+            }
+
+            HStack(spacing: 8) {
+                TextField("profile name", text: $store.newProfileName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 260)
+
+                Button {
+                    store.captureCurrent()
+                } label: {
+                    Label("Capture", systemImage: "tray.and.arrow.down.fill")
+                }
+                .disabled(store.isWorking)
+
+                Button {
+                    store.importAuthFile()
+                } label: {
+                    Label("Import auth.json", systemImage: "square.and.arrow.down")
+                }
+                .disabled(store.isWorking)
+            }
+            .controlSize(.small)
+            .padding(10)
+            .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
 
             HStack(spacing: 10) {
                 Button {
@@ -1511,7 +1854,6 @@ struct ManagerView: View {
                 } label: {
                     ActionButtonLabel(
                         title: "Switch",
-                        subtitle: "Restore selected profile",
                         systemImage: "arrow.triangle.2.circlepath"
                     )
                 }
@@ -1523,7 +1865,6 @@ struct ManagerView: View {
                 } label: {
                     ActionButtonLabel(
                         title: "Save Active",
-                        subtitle: "Update full app state",
                         systemImage: "externaldrive.fill.badge.checkmark"
                     )
                 }
@@ -1535,7 +1876,6 @@ struct ManagerView: View {
                 } label: {
                     ActionButtonLabel(
                         title: "Save Token",
-                        subtitle: "Store fresh auth only",
                         systemImage: "key.fill"
                     )
                 }
@@ -1547,7 +1887,6 @@ struct ManagerView: View {
                 } label: {
                     ActionButtonLabel(
                         title: "Delete",
-                        subtitle: "Remove saved profile",
                         systemImage: "trash.fill"
                     )
                 }
@@ -1556,8 +1895,7 @@ struct ManagerView: View {
             }
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
     }
 
     private var usagePanel: some View {
@@ -1608,56 +1946,6 @@ struct ManagerView: View {
                 metadataRow("Captured at", store.selectedMetadata.capturedAt)
                 metadataRow("Desktop state", store.selectedMetadata.desktopState)
                 metadataRow("Auth path", store.selectedMetadata.authURL.path)
-            }
-        }
-    }
-
-    private var importExportPanel: some View {
-        SectionPanel(title: "Backup & Import", systemImage: "archivebox.fill") {
-            HStack(spacing: 10) {
-                Button {
-                    store.exportSelectedProfile()
-                } label: {
-                    ActionButtonLabel(
-                        title: "Export Backup",
-                        subtitle: "Zip selected profile",
-                        systemImage: "square.and.arrow.up.fill"
-                    )
-                }
-                .buttonStyle(SecondaryActionButtonStyle(color: .blue))
-                .disabled(store.isWorking || store.selectedID == currentSelection)
-
-                Button {
-                    store.importAuthFile()
-                } label: {
-                    ActionButtonLabel(
-                        title: "Import Auth",
-                        subtitle: "Create auth-only profile",
-                        systemImage: "doc.badge.plus"
-                    )
-                }
-                .buttonStyle(SecondaryActionButtonStyle(color: .purple))
-                .disabled(store.isWorking)
-
-                Button {
-                    store.openProfilesFolder()
-                } label: {
-                    ActionButtonLabel(
-                        title: "Profiles Folder",
-                        subtitle: "Open local store",
-                        systemImage: "folder.fill"
-                    )
-                }
-                .buttonStyle(SecondaryActionButtonStyle(color: .gray))
-                .disabled(store.isWorking)
-            }
-
-            HStack(spacing: 8) {
-                Image(systemName: "lock.shield.fill")
-                    .foregroundStyle(.orange)
-                Text("Backups are local zip files and include sensitive auth data. Store them somewhere private.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -1720,16 +2008,8 @@ struct ManagerView: View {
                         .padding(12)
                 }
                 .frame(height: 132)
-                .background(Color(nsColor: .textBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
 
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .foregroundStyle(.green)
-                    Text("Tokens stay local and are hidden by default. They are never printed to terminal, logs, or network.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
         }
     }
@@ -1775,7 +2055,7 @@ struct ManagerView: View {
         if lower.contains("failed") || lower.contains("error") || lower.contains("khong") || lower.contains("cannot") {
             return .red
         }
-        if lower.contains("saved") || lower.contains("captured") || lower.contains("switched") || lower.contains("copied") {
+        if lower.contains("saved") || lower.contains("captured") || lower.contains("switched") || lower.contains("copied") || lower.contains("added") {
             return .green
         }
         return .secondary
@@ -1783,6 +2063,14 @@ struct ManagerView: View {
 
     private var messageIcon: String {
         messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill"
+    }
+
+    private var statusDisplayText: String {
+        let trimmed = store.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("Starting local login server") {
+            return "Login started. Continue in the browser, then return here."
+        }
+        return trimmed.isEmpty ? "Ready" : trimmed
     }
 
     private func healthColor(_ health: ProfileHealth) -> Color {
@@ -1885,12 +2173,19 @@ private struct ProfileCardButton: View {
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(cardBackground)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(cardBackground)
+                    )
+            }
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.accentColor.opacity(0.65) : Color(nsColor: .separatorColor).opacity(0.35), lineWidth: isSelected ? 1.3 : 1)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isSelected ? Color.accentColor.opacity(0.72) : Color.white.opacity(0.12), lineWidth: isSelected ? 1.3 : 1)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .onHover(perform: onHover)
@@ -1912,7 +2207,7 @@ private struct ProfileCardButton: View {
     }
 
     private var cardBackground: Color {
-        isSelected ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor)
+        isSelected ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.035)
     }
 }
 
@@ -1930,8 +2225,12 @@ private struct StatusPill: View {
             .frame(width: 82, alignment: .center)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(color.opacity(0.13))
-            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .background(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .stroke(color.opacity(0.22), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 }
 
@@ -1958,8 +2257,7 @@ private struct SummaryTile: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity)
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.58))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: color)
     }
 }
 
@@ -2039,8 +2337,12 @@ private struct HealthBadge: View {
             .frame(width: 82, alignment: .center)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(color.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .background(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .stroke(color.opacity(0.22), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
             .help(health.detail)
     }
 
@@ -2078,12 +2380,15 @@ private struct TokenStatusRow: View {
                 .foregroundStyle(color)
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
-                .background(color.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .background(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .stroke(color.opacity(0.22), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         }
         .padding(10)
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.58))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: color)
     }
 
     private var icon: String {
@@ -2107,30 +2412,23 @@ private struct SectionPanel<Content: View>: View {
             content
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: Color.accentColor)
     }
 }
 
 private struct ActionButtonLabel: View {
     let title: String
-    let subtitle: String
     let systemImage: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Image(systemName: systemImage)
                 .font(.system(size: 18, weight: .semibold))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                Text(subtitle)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-            }
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
         }
-        .frame(maxWidth: .infinity, minHeight: 74, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
         .padding(12)
     }
 }
@@ -2139,8 +2437,20 @@ private struct PrimaryActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(.white)
-            .background(Color.accentColor.opacity(configuration.isPressed ? 0.78 : 1))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentColor.opacity(configuration.isPressed ? 0.72 : 0.92))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                            .opacity(configuration.isPressed ? 0.10 : 0.04)
+                    )
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.24), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -2150,12 +2460,13 @@ private struct SecondaryActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(color)
-            .background(color.opacity(configuration.isPressed ? 0.18 : 0.10))
+            .background(.ultraThinMaterial)
+            .background(color.opacity(configuration.isPressed ? 0.18 : 0.08))
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(color.opacity(0.26), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(color.opacity(0.28), lineWidth: 1)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -2206,18 +2517,19 @@ private struct MenuBarSwitcherView: View {
             }
         }
         .padding(14)
-        .frame(width: 310)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(width: 326)
+        .background(LiquidGlassBackground(themeMode: store.themeMode))
+        .preferredColorScheme(store.themeMode.colorScheme)
+        .tint(store.themeMode.accent)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "person.2.badge.key.fill")
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(store.themeMode.accent)
                 .frame(width: 30, height: 30)
-                .background(Color.accentColor.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .liquidGlass(cornerRadius: 7, tint: store.themeMode.accent)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Codex Accounts")
@@ -2230,6 +2542,15 @@ private struct MenuBarSwitcherView: View {
             }
 
             Spacer()
+
+            Button {
+                store.setThemeMode(store.themeMode == .dark ? .light : .dark)
+            } label: {
+                Image(systemName: store.themeMode.systemImage)
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.borderless)
+            .help("Switch theme")
 
             Button(action: refresh) {
                 Image(systemName: "arrow.clockwise")
@@ -2274,18 +2595,29 @@ private struct MenuBarSwitcherView: View {
                                     .foregroundStyle(.green)
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 3)
-                                    .background(Color.green.opacity(0.12))
-                                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                                    .background(.ultraThinMaterial)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .stroke(Color.green.opacity(0.22), lineWidth: 1)
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                             }
                         }
                         .padding(9)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor))
+                        .background {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.ultraThinMaterial)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.04))
+                                )
+                        }
                         .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.45) : Color(nsColor: .separatorColor).opacity(0.28), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(row.id == state.selectedProfileID ? Color.accentColor.opacity(0.55) : Color.white.opacity(0.12), lineWidth: 1)
                         )
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .onHover { isHovering in
@@ -2319,23 +2651,21 @@ private struct MenuBarSwitcherView: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: store.themeMode.accent)
     }
 
     private var messageRow: some View {
         HStack(alignment: .top, spacing: 7) {
             Image(systemName: messageColor == .red ? "exclamationmark.triangle.fill" : "info.circle.fill")
                 .foregroundStyle(messageColor)
-            Text(store.message)
+            Text(menuMessageText)
                 .font(.caption)
                 .foregroundStyle(messageColor)
                 .lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(8)
-        .background(messageColor.opacity(0.10))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: messageColor)
     }
 
     private var savedRows: [ProfileRow] {
@@ -2393,6 +2723,14 @@ private struct MenuBarSwitcherView: View {
         }
         return .secondary
     }
+
+    private var menuMessageText: String {
+        let trimmed = store.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("Starting local login server") {
+            return "Login started. Continue in the browser, then return here."
+        }
+        return trimmed
+    }
 }
 
 private struct MenuBarUsageView: View {
@@ -2434,8 +2772,7 @@ private struct MenuBarUsageView: View {
             )
         }
         .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .liquidGlass(cornerRadius: 8, tint: Color.accentColor)
     }
 
     private func resetText(for limit: UsageLimitWindow?) -> String {
@@ -2551,7 +2888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentSize = NSSize(width: 310, height: 520)
+        popover.contentSize = NSSize(width: 326, height: 540)
         popover.contentViewController = NSHostingController(
             rootView: MenuBarSwitcherView(
                 store: store,

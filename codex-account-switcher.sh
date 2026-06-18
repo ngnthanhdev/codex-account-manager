@@ -18,6 +18,7 @@ Codex Account Switcher
 
 Usage:
   codex-account-switcher.sh capture <profile>
+  codex-account-switcher.sh import-home <profile> <codex-home>
   codex-account-switcher.sh save-auth <profile>
   codex-account-switcher.sh switch <profile> [--no-open]
   codex-account-switcher.sh list [--plain]
@@ -362,6 +363,34 @@ cmd_import_auth() {
   log "imported auth.json as profile '$name'"
 }
 
+cmd_import_home() {
+  local name="${1:-}"
+  local codex_home="${2:-}"
+  validate_profile_name "$name"
+  [[ -n "$codex_home" ]] || fail "Codex home path is required"
+  [[ -s "$codex_home/auth.json" ]] || fail "Codex home auth.json is missing or empty"
+  with_lock
+
+  local dir
+  dir="$(profile_dir "$name")"
+  [[ ! -e "$dir" ]] || fail "profile '$name' already exists"
+
+  mkdir -p "$dir/auth" "$dir/app-support"
+  cp -p "$codex_home/auth.json" "$(profile_auth_file "$name")"
+  chmod 600 "$(profile_auth_file "$name")" 2>/dev/null || true
+
+  {
+    printf 'name=%s\n' "$name"
+    printf 'captured_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'auth_file=%s\n' "$codex_home/auth.json"
+    printf 'app_support=%s\n' "$codex_home"
+    printf 'managed_codex_home=%s\n' "$codex_home"
+    printf 'imported_from_managed_login=true\n'
+  } > "$dir/profile.env"
+
+  log "added Codex account as profile '$name'"
+}
+
 cmd_export_profile() {
   local name="${1:-}"
   local zip_path="${2:-}"
@@ -410,6 +439,7 @@ main() {
 
   case "$command" in
     capture) cmd_capture "$@" ;;
+    import-home) cmd_import_home "$@" ;;
     save-auth) cmd_save_auth "$@" ;;
     switch) cmd_switch "$@" ;;
     list) cmd_list "$@" ;;
